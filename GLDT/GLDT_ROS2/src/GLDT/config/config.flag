@@ -1,0 +1,171 @@
+# ===========================
+# Video reader configuration
+# ===========================
+# Video reader mode: opencv - use OpenCV (good compatibility)
+#                    ffmpeg - read via FFmpeg (better performance)
+#                    gstreamer - use GStreamer (streaming support)
+--video_reader_mode=gstreamer
+# Video downscaling: enable downscaling to improve performance
+--enable_video_downscaling=true
+# Enable saving output video with tracking overlays
+--enable_video_output=true
+# Enable on-screen display (imshow/waitKey/overlay).
+--enable_display=true
+# single_thread_mode or multithreaded mode
+--single_thread_mode=false
+
+
+# ===========================
+# Algorithm selection
+# ===========================
+# Detection mode: 0=global only, 1=global+local (default)
+--detection_mode=1
+
+# Use original ByteTrack: true=original, false=enhanced version
+--use_original_bytetrack=false
+
+## Enable GMM memory recovery
+--enable_gmm_memory_recovery=true
+
+# Extract appearance during detection: store thumbnails (recommended off to save cost)
+--enable_appearance=true
+
+
+# ===========================
+# Global model
+# ===========================
+# Global confidence threshold (0.0-1.0): higher -> stricter (fewer FPs, more FNs)
+--global_conf_threshold=0.5
+# Global NMS threshold (0.0-1.0): higher -> keep more overlapping boxes
+--global_nms_threshold=0.45
+# Preprocess mode: 0=CPU, 1=CPU+GPU hybrid, 2=GPU
+--global_preprocess_mode=2
+# Postprocess mode: 0=CPU, 1=GPU
+--global_postprocess_mode=1
+# Global phase duration: consecutive frames using global detection
+--global_duration=30
+
+# ===========================
+# Local model
+# ===========================
+# Local confidence threshold (0.0-1.0)
+--local_conf_threshold=0.4
+# Local NMS threshold (0.0-1.0)
+--local_nms_threshold=0.45
+# Preprocess mode: 0=CPU, 1=CPU+GPU hybrid, 2=GPU
+--local_preprocess_mode=2
+# Postprocess mode: 0=CPU, 1=GPU
+--local_postprocess_mode=0
+# Local phase duration: consecutive frames using local detection
+--local_duration=120
+
+# ===========================
+# ROI (Region of Interest)
+# ===========================
+# ROI margin (px): extra pixels around box for motion tolerance
+--roi_margin=60
+# ROI minimum size (px)
+--roi_min_size=300
+# ROI maximum size (px)
+--roi_max_size=1200
+# ROI overlap threshold (IoU) for merging ROIs
+--roi_overlap_threshold=0.1
+# ROI max no-detection frames before removal
+--roi_max_no_detection=10
+# ROI memory frames for recovery
+--roi_memory_frames=30
+
+# ===========================
+# Adaptive ROI
+# ===========================
+# Enable adaptive ROI size
+--enable_adaptive_roi_size=true
+# ROI target scale factor (relative to detection box), recommended 3-8x
+--roi_target_scale_factor=5.0
+# ROI size smoothing factor (0.1-0.5): smaller = smoother
+--roi_size_smooth_factor=0.3
+
+# ===========================
+# Tracking configuration
+# ===========================
+# High-confidence tracking threshold
+--track_high_thresh=0.6
+# Low-confidence tracking threshold (for recovery)
+--track_low_thresh=0.3
+# New track threshold
+--new_track_thresh=0.4
+# Track buffer size (frames)
+--track_buffer=30
+# Matching IoU threshold
+--match_thresh=0.5
+
+# ===========================
+# ROI-constrained tracking
+# ===========================
+# ROI matching threshold
+--roi_match_thresh=0.7
+# ROI spatial tolerance (px): max distance from ROI center to track
+--roi_spatial_tolerance=80.0
+# ROI reactivation threshold for lost tracks
+--roi_reactivate_thresh=0.4
+
+# ===========================
+# Candidate targets
+# ===========================
+# Frames required to confirm a candidate as a real target
+--candidate_confirm_frames=15
+# Candidate window size for stability evaluation
+--candidate_window=30
+
+# ===========================
+# Performance
+# ===========================
+# Enable batch inference to improve GPU utilization
+--enable_batch_inference=true
+# Batch size (too large may cause OOM)
+--batch_size=4
+# Enable multithreaded parallel processing
+--enable_parallel_processing=true
+# Number of threads (recommend CPU cores)
+--num_threads=4
+
+# ===========================
+# Cost matrix fusion weights
+# ===========================
+# IoU cost weight
+--cost_iou_weight=0.6
+# ROI constraint cost weight
+--cost_roi_weight=0.25
+# Historical trajectory radius cost weight
+--cost_radius_weight=0.15
+# Spatial distance cost weight
+--cost_spatial_weight=0.2
+# Historical trajectory radius factor
+--trajectory_radius_factor=2.0
+# Use enhanced matching (multi-feature fusion)
+--use_enhanced_matching=true
+
+# ===========================
+# Logging
+# ===========================
+# Log level: 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
+--log_level=0
+# Log to console
+--log_to_console=true
+# Log to file
+--log_to_file=true
+# Log directory
+--custom_log_dir=logs
+# Verbose logs
+--verbose_log=false
+# Color logs in console
+--color_log=true
+# Max size per log file (MB)
+--max_log_size=30
+# Log inference details
+--log_inference_details=false
+# Log TensorRT binding info
+--log_binding_info=false
+# Log detection boxes details
+--log_detection_boxes=false
+

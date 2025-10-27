@@ -1,0 +1,30 @@
+# YOLO Detection Node Default Parameters
+
+detection_node:
+  ros__parameters:
+    # 模型参数
+    weight: "weights/yolo11s-p2.engine"
+    device: "cuda:0"
+    conf_threshold: 0.5
+    iou_threshold: 0.7
+    
+    # 输入参数
+    input_type: "video"  # camera, video, image
+    input_path: "/home/ljq/ros2_ws/DJI_20250922112849_0002_S.MP4"
+    camera_id: 0
+    width: 1920
+    height: 1080
+    fps: 30
+    
+    # 显示参数
+    display_width: 640
+    display_height: 480
+    
+    # 视频和结果保存参数
+    save_video: true
+    show_result: true
+    save_result: true
+    save_path: "results"
+    save_original_video: false
+    max_queue_size: 100
+

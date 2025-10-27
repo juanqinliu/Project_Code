@@ -1,0 +1,24 @@
+全局检测器导出onnx：
+导出动态：python3 export_onnx/pt_onnx.py --model /home/ljq/UAV-Tracking/ultralytics/runs/detect/train46/weights/best.pt --output ./model_onnx/global_model_dynamic.onnx --imgsz 640 --dynamic --simplify
+导出静态：python3 export_onnx/pt_onnx.py --model /home/ljq/UAV-Tracking/ultralytics/runs/detect/train46/weights/best.pt --output ./model_onnx/global_model_static.onnx --imgsz 640 --static --simplify
+
+全局检测导出engine：
+bash build.sh
+导出动态：./export_engine/build/build ./model_onnx/global_model_dynamic.onnx fp16
+导出静态：./export_engine/build/build ./model_onnx/global_model_static.onnx fp16（报错待解决）
+
+全局检测器导出带plugin的onnx：
+动态：
+trt插件：python3 export_plugin_onnx/onnx_trt_plugin.py --model ./model_onnx/global_model_dynamic.onnx --output ./model_onnx/global_model_dynamic_trt.onnx --plugin-type trt_plugin 
+自定义插件：python3 export_plugin_onnx/onnx_trt_plugin.py --model ./model_onnx/global_model_dynamic.onnx --output ./model_onnx/global_model_dynamic_standard.onnx  
+静态：
+    由于导出静态engine报错，所以静态onnx也报错，待解决
+
+全局检测器导出带plugin的engine：
+动态：
+trt插件：./export_plugin_engine/build/build ./model_onnx/global_model_dynamic_trt.onnx --output=./model_engine/global_model_dynamic_trt.engine --fp16
+自定义插件：./export_plugin_engine/build/build ./model_onnx/global_model_dynamic_standard.onnx --output=./model_engine/global_model_dynamic_standard.engine --fp16
+
+(base) ljq@ljq:~/UAV-Tracking/ultralytics/int8_backup$ python3 export_plugin_onnx/fix_onnx_types.py --model ./model_onnx/global_model_dynamic_trt.onnx --output ./model_onnx/global_model_dynamic_trt_fix.onnx
+(base) ljq@ljq:~/UAV-Tracking/ultralytics/int8_backup$ ./export_plugin_engine/build/build --onnx ./model_onnx/global_model_dynamic_standard.onnx --output ./model_engine/global_model_dynamic_standard.engine --fp16
+
