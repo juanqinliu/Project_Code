@@ -31,7 +31,17 @@ cv::Mat& _attach_aruco(int id, cv::Mat& img)
 {
   cv::Mat marker_img;
   std::vector<cv::Mat> ch(3);
+  
+  // 兼容不同版本的OpenCV ArUco API
+  // OpenCV 4.7.0+ 使用新API，之前版本使用旧API
+#if CV_VERSION_MAJOR >= 4 && CV_VERSION_MINOR >= 7
+  // 新版本API (OpenCV 4.7.0+): getPredefinedDictionary返回Dictionary对象
+  cv::aruco::Dictionary dict = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_5X5_1000);
+#else
+  // 旧版本API (OpenCV < 4.7.0): getPredefinedDictionary返回Ptr<Dictionary>
   cv::Ptr<cv::aruco::Dictionary> dict = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_5X5_1000);
+#endif
+  
   ch[0] = cv::Mat::zeros(22, 22, CV_8UC1);
   ch[1] = cv::Mat::zeros(22, 22, CV_8UC1);
   ch[2] = cv::Mat::zeros(22, 22, CV_8UC1);
@@ -44,12 +54,23 @@ cv::Mat& _attach_aruco(int id, cv::Mat& img)
 
   int id_k = id % 1000;
 
+#if CV_VERSION_MAJOR >= 4 && CV_VERSION_MINOR >= 7
+  // 新版本API: 使用generateImageMarker
+  cv::aruco::generateImageMarker(dict, id_k, 14, marker_img, 1);
+  marker_img.copyTo(ch[0](inner_roi));
+  cv::aruco::generateImageMarker(dict, id_k, 14, marker_img, 1);
+  marker_img.copyTo(ch[1](inner_roi));
+  cv::aruco::generateImageMarker(dict, id_k, 14, marker_img, 1);
+  marker_img.copyTo(ch[2](inner_roi));
+#else
+  // 旧版本API: 使用drawMarker
   cv::aruco::drawMarker(dict, id_k, 14, marker_img, 1);
   marker_img.copyTo(ch[0](inner_roi));
   cv::aruco::drawMarker(dict, id_k, 14, marker_img, 1);
   marker_img.copyTo(ch[1](inner_roi));
   cv::aruco::drawMarker(dict, id_k, 14, marker_img, 1);
   marker_img.copyTo(ch[2](inner_roi));
+#endif
 
   cv::merge(ch, marker_img);
   marker_img.copyTo(img(full_roi));

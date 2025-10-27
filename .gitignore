@@ -33,3 +33,8 @@ devel/
 install/
 log/
 logs/
+
+# Results
+Results/
+Weights/
+Videos/
