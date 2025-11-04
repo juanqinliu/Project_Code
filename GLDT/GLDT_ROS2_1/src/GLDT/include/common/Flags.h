@@ -89,6 +89,7 @@ DECLARE_bool(verbose_log);
 DECLARE_bool(log_inference_details);
 DECLARE_bool(log_binding_info);
 DECLARE_bool(log_detection_boxes);
+DECLARE_bool(log_batch_timing);
 
 // Helper functions
 namespace flags {

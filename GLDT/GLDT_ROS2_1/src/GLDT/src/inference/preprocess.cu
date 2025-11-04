@@ -506,7 +506,7 @@ void process_input_cpu(cv::Mat& src, float* input_device_buffer) {
                          kInputH * kInputW * 3 * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-// 🔥 New: high-performance ROI preprocess function
+// 🔥 新增：高性能ROI预处理函数（支持stream）
 void cuda_preprocess_roi_safe(uint8_t* src, int src_width, int src_height,
                              float* dst, int dst_width, int dst_height,
                              void* temp_buffer, cudaStream_t stream) {
@@ -557,6 +557,28 @@ void process_roi_gpu(const cv::Mat& roi_in, float* output, void*, cudaStream_t) 
                                          output, kInputW, kInputH);
     if (ret != 0) {
         throw std::runtime_error("ROI preprocess failed");
+    }
+}
+
+// 🔥 支持指定stream的GPU前处理（用于多stream并行）
+void process_input_gpu_stream(const cv::Mat& src, float* output, void* temp_buffer, cudaStream_t stream) {
+    try {
+        // 确保图像连续
+        cv::Mat image;
+        if (src.isContinuous()) {
+            image = src;
+        } else {
+            image = src.clone();
+        }
+        
+        // 直接使用cuda_preprocess_roi_safe，它支持stream参数
+        cuda_preprocess_roi_safe(image.ptr(), image.cols, image.rows,
+                                output, kInputW, kInputH,
+                                temp_buffer, stream);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ [process_input_gpu_stream] Exception: " << e.what() << std::endl;
+        throw;
     }
 }
 

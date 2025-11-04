@@ -8,7 +8,7 @@
 # Video downscaling: enable downscaling to improve performance
 --enable_video_downscaling=true
 # Enable saving output video with tracking overlays
---enable_video_output=false
+--enable_video_output=true
 # Enable on-screen display (imshow/waitKey/overlay).
 --enable_display=true
 # single_thread_mode or multithreaded mode
@@ -168,4 +168,6 @@
 --log_binding_info=false
 # Log detection boxes details
 --log_detection_boxes=false
+# Log detailed batch inference timing (for debugging parallel inference)
+--log_batch_timing=true
 

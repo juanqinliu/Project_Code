@@ -11,7 +11,7 @@ echo "Created log directory: $LOG_DIR"
 # LOCAL_MODEL="Weights/local_fp16.engine"
 
 GLOBAL_MODEL="Weights/global_fixed_best_train63_int8.engine"
-LOCAL_MODEL="Weights/local_fixedwings_train62.engine"
+LOCAL_MODEL="Weights/local_fp16.engine"
 
 VIDEO_PATH="Videos"   # Video path
 OUTPUT_DIR="Results"  # Output directory

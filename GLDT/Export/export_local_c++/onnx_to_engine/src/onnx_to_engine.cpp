@@ -251,13 +251,23 @@ bool build_engine(const std::string& onnx_file, const std::string& engine_file,
     config->addOptimizationProfile(profile);
     
     // Set precision flags
-    if (precision == PrecisionMode::FP16) {
-        config->setFlag(nvinfer1::BuilderFlag::kFP16);  // Enable FP16
-    }
-    // Initialize calibrator to nullptr
     Int8EntropyCalibrator* calibrator = nullptr;
-    // Set INT8 based on precision mode
-    if (precision == PrecisionMode::INT8) {
+    
+    if (precision == PrecisionMode::FP16) {
+        std::cout << "\n=== Configuring FP16 Precision ===" << std::endl;
+        config->setFlag(nvinfer1::BuilderFlag::kFP16);
+        
+        // Check FP16 support
+        if (!builder->platformHasFastFp16()) {
+            std::cout << "Warning: Platform does not support fast FP16, performance may be limited" << std::endl;
+        } else {
+            std::cout << "✅ Platform supports fast FP16" << std::endl;
+        }
+        
+        // Prefer FP16 over FP32 when possible
+        config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+        std::cout << "✅ FP16 precision constraints enabled" << std::endl;
+    } else if (precision == PrecisionMode::INT8) {
         std::cout << "\n=== Configuring INT8 Quantization ===" << std::endl;
         config->setFlag(nvinfer1::BuilderFlag::kINT8);  // Enable INT8
         
@@ -282,9 +292,7 @@ bool build_engine(const std::string& onnx_file, const std::string& engine_file,
             std::cerr << "Failed to create calibrator: " << e.what() << std::endl;
             return false;
         }
-    } else if (precision == PrecisionMode::FP16) {
-        std::cout << "\n=== Using FP16 Precision ===" << std::endl;
-    } else {
+    } else if (precision == PrecisionMode::FP32) {
         std::cout << "\n=== Using FP32 Precision ===" << std::endl;
     }
     
@@ -373,14 +381,20 @@ bool build_engine(const std::string& onnx_file, const std::string& engine_file,
     else if (precision == PrecisionMode::FP16) std::cout << "FP16";
     else std::cout << "FP32";
     std::cout << std::endl;
-    std::cout << "Dynamic shapes support: " << (has_dynamic_shapes ? "Yes" : "No") << std::endl;
+    std::cout << "Dynamic shapes support: " << (has_dynamic_shapes ? "Yes ✓" : "No ✗") << std::endl;
     
     if (!has_dynamic_shapes) {
-        std::cout << "\nWarning: Engine does not support dynamic batching!" << std::endl;
-        std::cout << "Suggestions:" << std::endl;
-        std::cout << "1. Check if ONNX model correctly sets dynamic batch dimensions" << std::endl;
-        std::cout << "2. Ensure TensorRT build configuration correctly sets dynamic ranges" << std::endl;
-        std::cout << "3. Consider using a newer version of TensorRT" << std::endl;
+        std::cout << "\n⚠️  WARNING: Engine does not support dynamic batching!" << std::endl;
+        std::cout << "This will prevent batch inference optimization." << std::endl;
+        std::cout << "\nTroubleshooting:" << std::endl;
+        std::cout << "1. Verify ONNX has dynamic batch: first dim should be 'batch_size'" << std::endl;
+        std::cout << "2. Check optimization profile configuration" << std::endl;
+        std::cout << "3. Ensure min/opt/max batch values are valid" << std::endl;
+    } else {
+        std::cout << "\n✅ Dynamic batch support verified!" << std::endl;
+        std::cout << "Engine supports batch sizes from " << min_batch 
+                  << " to " << max_batch << std::endl;
+        std::cout << "Optimized for batch size: " << opt_batch << std::endl;
     }
     
     return true;

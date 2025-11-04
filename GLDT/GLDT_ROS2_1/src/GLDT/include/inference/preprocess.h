@@ -28,6 +28,9 @@ void cuda_preprocess_roi_safe(uint8_t* src, int src_width, int src_height,
                               void* temp_buffer, cudaStream_t stream);
 void process_roi_gpu(const cv::Mat& roi, float* output, void* temp_buffer, cudaStream_t stream);
 
+// 🔥 支持指定stream的前处理函数（用于并行）
+void process_input_gpu_stream(const cv::Mat& src, float* output, void* temp_buffer, cudaStream_t stream);
+
 // 线程清理函数
 void cleanup_current_thread();
 

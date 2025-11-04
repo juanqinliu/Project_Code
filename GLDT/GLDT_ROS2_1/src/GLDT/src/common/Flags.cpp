@@ -90,6 +90,7 @@ DEFINE_bool(verbose_log, false, "Enable verbose log");
 DEFINE_bool(log_inference_details, false, "Record inference details");
 DEFINE_bool(log_binding_info, false, "Record binding information");
 DEFINE_bool(log_detection_boxes, false, "Record detection box details");
+DEFINE_bool(log_batch_timing, true, "Log detailed batch inference timing for parallel inference verification");
 
 namespace flags {
 

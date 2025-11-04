@@ -57,6 +57,7 @@ TensorRTLocalInference::TensorRTLocalInference(const std::string& engine_path)
     // Initialize preprocess and batch processing context
     preprocess_ctx_ = std::make_unique<PreprocessContext>();
     batch_ctx_ = std::make_unique<BatchMemoryContext>();
+    multi_stream_ctx_ = std::make_unique<MultiStreamPreprocessContext>();  // 🔥 初始化多stream上下文
     // Read engine file
     std::ifstream file(engine_path, std::ios::binary);
     if (!file.good()) {
@@ -251,6 +252,7 @@ TensorRTLocalInference::~TensorRTLocalInference() {
     // But ensure they are correctly reset
     preprocess_ctx_.reset();
     batch_ctx_.reset();
+    multi_stream_ctx_.reset();  // 🔥 清理多stream上下文
 }
 
 std::vector<Detection> TensorRTLocalInference::detect(const cv::Mat& image, float conf_threshold) {
@@ -663,9 +665,13 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::detectBatch(const st
     // Get maximum batch size limit
     int max_batch_size = getMaxBatchSize();
     
-    // 🔥 Safety limit: limit batch size when processing batch of local model, avoid memory problem
-    int safe_batch_size = std::min(max_batch_size, 2); // Limit to 2 or smaller, ensure memory safety
+    // 🔥 使用配置的最大batch size，不再硬编码限制
+    int safe_batch_size = std::min(max_batch_size, static_cast<int>(images.size()));
     const int total_images = images.size();
+    
+    if (FLAGS_log_batch_timing) {
+        LOG_INFO("📦 [批量检测] 总ROI数=" << total_images << ", 最大batch=" << max_batch_size << ", 实际batch=" << safe_batch_size);
+    }
     
     // Batch processing
     for (int start_idx = 0; start_idx < total_images; start_idx += safe_batch_size) {
@@ -718,9 +724,14 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::executeBatchInferenc
         auto preprocess_start = std::chrono::high_resolution_clock::now();
         // 🔥 Batch preprocess - use instance-level buffer
         preprocessBatch(batch_images, static_cast<float*>(batch_ctx_->input_buffer));
+        cudaStreamSynchronize(stream_); // 确保前处理完成
         auto preprocess_end = std::chrono::high_resolution_clock::now();
         double preprocess_time = std::chrono::duration<double, std::milli>(preprocess_end - preprocess_start).count();
         updateLocalPreprocessTime(preprocess_time);
+        
+        if (FLAGS_log_batch_timing) {
+            LOG_INFO("⏱️  [批量推理时间-前处理] batch=" << batch_size << ", 前处理=" << preprocess_time << "ms");
+        }
         
         // 🔥 Create batch binding - use instance-level buffer (full binding)
         int nb_bindings = engine_->getNbBindings();
@@ -794,6 +805,13 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::executeBatchInferenc
         }
         
         cudaStreamSynchronize(stream_); // Ensure inference is complete
+        auto inference_end = std::chrono::high_resolution_clock::now();
+        double inference_time = std::chrono::duration<double, std::milli>(inference_end - inference_start).count();
+        updateLocalInferenceTime(inference_time);
+        
+        if (FLAGS_log_batch_timing) {
+            LOG_INFO("⏱️  [批量推理时间-推理] batch=" << batch_size << ", 推理=" << inference_time << "ms");
+        }
         
         // 🔥 Immediately release temporary output buffer, avoid memory leak
         for (void* ptr : extra_output_buffers) {
@@ -802,10 +820,6 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::executeBatchInferenc
             }
         }
         extra_output_buffers.clear();
-        
-        auto inference_end = std::chrono::high_resolution_clock::now();
-        double inference_time = std::chrono::duration<double, std::milli>(inference_end - inference_start).count();
-        updateLocalInferenceTime(inference_time);
         
         auto copy_start = std::chrono::high_resolution_clock::now();
         // 🔥 Copy output data to CPU
@@ -818,6 +832,10 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::executeBatchInferenc
         cudaStreamSynchronize(stream_);
         auto copy_end = std::chrono::high_resolution_clock::now();
         double copy_time = std::chrono::duration<double, std::milli>(copy_end - copy_start).count();
+        
+        if (FLAGS_log_batch_timing) {
+            LOG_INFO("⏱️  [批量推理时间-拷贝] batch=" << batch_size << ", GPU->CPU拷贝=" << copy_time << "ms");
+        }
         
         auto postprocess_start = std::chrono::high_resolution_clock::now();
         
@@ -863,6 +881,18 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::executeBatchInferenc
         for (const auto& result : results) {
             total_detections += result.size();
         }
+        
+        if (FLAGS_log_batch_timing) {
+            LOG_INFO("⏱️  [批量推理时间-后处理] batch=" << batch_size << ", 后处理=" << postprocess_time << "ms");
+            LOG_INFO("⏱️  [批量推理时间-总计] batch=" << batch_size 
+                     << ", 前处理=" << preprocess_time << "ms"
+                     << ", 推理=" << inference_time << "ms"
+                     << ", 拷贝=" << copy_time << "ms"
+                     << ", 后处理=" << postprocess_time << "ms"
+                     << ", 总计=" << total_time << "ms"
+                     << ", 检测数=" << total_detections 
+                     << " | 平均每ROI=" << (total_time/batch_size) << "ms");
+        }
         // Remove detailed performance statistics
         
     } catch (const std::exception& e) {
@@ -877,17 +907,108 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::executeBatchInferenc
     return results;
 }
 
-// 🔥 新增：批量预处理
+// 🔥 MultiStreamPreprocessContext实现
+void TensorRTLocalInference::MultiStreamPreprocessContext::cleanup() {
+    // 不在锁内进行CUDA同步，避免长时间阻塞
+    std::vector<cudaStream_t> streams_to_destroy;
+    std::vector<void*> buffers_to_free;
+    
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        streams_to_destroy = streams;
+        buffers_to_free = temp_buffers;
+        streams.clear();
+        temp_buffers.clear();
+        buffer_capacities.clear();
+        num_streams = 0;
+    }
+    
+    // 在锁外进行CUDA操作
+    for (auto stream : streams_to_destroy) {
+        if (stream) {
+            cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+        }
+    }
+    for (auto buffer : buffers_to_free) {
+        if (buffer) cudaFree(buffer);
+    }
+}
+
+bool TensorRTLocalInference::MultiStreamPreprocessContext::ensure_streams(
+    int required_streams, size_t buffer_size_per_stream) {
+    
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    // 检查是否需要重新分配
+    if (required_streams <= num_streams) {
+        bool all_buffers_ok = true;
+        for (int i = 0; i < required_streams; i++) {
+            if (buffer_capacities[i] < buffer_size_per_stream) {
+                all_buffers_ok = false;
+                break;
+            }
+        }
+        if (all_buffers_ok) return true;
+    }
+    
+    // 需要重新分配
+    // 先清理旧资源（不在锁内进行同步）
+    std::vector<cudaStream_t> old_streams = streams;
+    std::vector<void*> old_buffers = temp_buffers;
+    
+    streams.clear();
+    temp_buffers.clear();
+    buffer_capacities.clear();
+    
+    // 在锁外清理旧资源
+    mutex.unlock();
+    for (auto stream : old_streams) {
+        if (stream) {
+            cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+        }
+    }
+    for (auto buffer : old_buffers) {
+        if (buffer) cudaFree(buffer);
+    }
+    mutex.lock();
+    
+    // 创建新的streams和buffers
+    streams.resize(required_streams);
+    temp_buffers.resize(required_streams);
+    buffer_capacities.resize(required_streams);
+    
+    for (int i = 0; i < required_streams; i++) {
+        // 创建stream
+        cudaError_t stream_status = cudaStreamCreate(&streams[i]);
+        if (stream_status != cudaSuccess) {
+            LOG_ERROR("❌ 创建CUDA stream " << i << " 失败: " << cudaGetErrorString(stream_status));
+            return false;
+        }
+        
+        // 分配临时缓冲区
+        cudaError_t malloc_status = cudaMalloc(&temp_buffers[i], buffer_size_per_stream);
+        if (malloc_status != cudaSuccess) {
+            LOG_ERROR("❌ 分配CUDA临时缓冲区 " << i << " 失败: " << cudaGetErrorString(malloc_status));
+            return false;
+        }
+        
+        buffer_capacities[i] = buffer_size_per_stream;
+    }
+    
+    num_streams = required_streams;
+    return true;
+}
+
+// 🔥 新增：批量预处理（真正的并行版本）
 void TensorRTLocalInference::preprocessBatch(const std::vector<cv::Mat>& images, float* batch_input_device) {
     const int batch_size = images.size();
-
-            auto start_time = std::chrono::high_resolution_clock::now();
-
-    // Only keep batch GPU preprocess mode
+    
+    // CPU preprocess mode
     if (preprocess_mode_ == 0) {
-        // CPU preprocess, prepare all data at once and copy to GPU
         std::vector<float> batch_input_host(batch_size * input_size_);
-
+        
         #pragma omp parallel for
         for (int i = 0; i < batch_size; ++i) {
             std::vector<float> input_data(input_size_);
@@ -895,28 +1016,69 @@ void TensorRTLocalInference::preprocessBatch(const std::vector<cv::Mat>& images,
             std::memcpy(batch_input_host.data() + i * input_size_, 
                     input_data.data(), input_size_ * sizeof(float));
         }
-
-        // Copy all data to GPU at once
+        
         cudaMemcpyAsync(batch_input_device, batch_input_host.data(), 
                     batch_size * input_size_ * sizeof(float), 
                     cudaMemcpyHostToDevice, stream_);
-    } else {
-        // GPU preprocess mode
-        for (int i = 0; i < batch_size; ++i) {
-            float* current_input_device = batch_input_device + i * input_size_;
-
-            if (preprocess_mode_ == 1) {
-                preprocessImageCVAffine(images[i], current_input_device);
-            } else if (preprocess_mode_ == 2) {
+                    
+        if (FLAGS_log_batch_timing) {
+            LOG_INFO("🔧 [前处理] CPU并行模式, batch=" << batch_size << ", 使用OpenMP并行");
+        }
+    } 
+    // 🔥 GPU preprocess mode - 使用多CUDA stream真正并行
+    else if (preprocess_mode_ == 2) {
+        // 1. 初始化多stream上下文
+        if (!multi_stream_ctx_) {
+            multi_stream_ctx_ = std::make_unique<MultiStreamPreprocessContext>();
+        }
+        
+        // 2. 计算每个ROI需要的临时缓冲区大小
+        size_t max_image_size = 0;
+        for (const auto& img : images) {
+            size_t img_size = img.step * img.rows;
+            max_image_size = std::max(max_image_size, img_size);
+        }
+        
+        // 3. 确保有足够的stream和临时缓冲区
+        if (!multi_stream_ctx_->ensure_streams(batch_size, max_image_size)) {
+            LOG_WARNING("⚠️ CUDA stream分配失败，回退到串行处理");
+            for (int i = 0; i < batch_size; ++i) {
+                float* current_input_device = batch_input_device + i * input_size_;
                 preprocessImageGPU(images[i], current_input_device);
             }
+            return;
+        }
+        
+        // 4. 🔥 并行提交所有ROI到不同stream（真正的并行）
+        for (int i = 0; i < batch_size; ++i) {
+            float* current_input_device = batch_input_device + i * input_size_;
+            cudaStream_t current_stream = multi_stream_ctx_->streams[i];
+            void* temp_buffer = multi_stream_ctx_->temp_buffers[i];
+            
+            // 在独立stream上处理
+            process_input_gpu_stream(images[i], current_input_device, temp_buffer, current_stream);
+        }
+        
+        // 5. 等待所有stream完成
+        for (int i = 0; i < batch_size; ++i) {
+            cudaStreamSynchronize(multi_stream_ctx_->streams[i]);
+        }
+        
+        if (FLAGS_log_batch_timing) {
+            LOG_INFO("🔧 [前处理] GPU多Stream并行模式, batch=" << batch_size << ", 使用" << batch_size << "个独立CUDA stream");
         }
     }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double preprocess_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-    // Remove batch preprocess completion log
+    // 混合模式
+    else {
+        for (int i = 0; i < batch_size; ++i) {
+            float* current_input_device = batch_input_device + i * input_size_;
+            preprocessImageCVAffine(images[i], current_input_device);
+        }
+        
+        if (FLAGS_log_batch_timing) {
+            LOG_INFO("🔧 [前处理] CV仿射变换模式, batch=" << batch_size);
+        }
+    }
 }
 
 // 🔥 Modify: improve batch postprocess function implementation

@@ -39,12 +39,12 @@ VERBOSE=false
 
 # ONNX to Engine parameters
 MIN_BATCH=1
-OPT_BATCH=4
-MAX_BATCH=32
-WORKSPACE=2048
+OPT_BATCH=3          # 🔥 修改：匹配实际ROI数量
+MAX_BATCH=8          # 🔥 修改：降低以节省编译时间
+WORKSPACE=4096       # 🔥 修改：增加以支持更好的优化
 CALIB_DIR="calib_data"
 CALIB_LIST="calib_list.txt"
-PRECISION="int8"
+PRECISION="fp16"     # 🔥 修改：使用FP16而非INT8
 AUTO_CALIB=false
 CALIB_NUM=1000
 SKIP_BUILD=false

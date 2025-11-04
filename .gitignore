@@ -38,3 +38,8 @@ logs/
 Results/
 Weights/
 Videos/
+
+# model files
+*.engine
+*.onnx
+*.pt
