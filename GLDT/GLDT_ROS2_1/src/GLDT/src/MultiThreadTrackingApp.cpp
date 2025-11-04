@@ -17,8 +17,8 @@ namespace fs = std::filesystem;
 namespace tracking {
 
 // Static members initialization
-const int READING_BUFFER_SIZE = 10;   
-const int PROCESSING_BUFFER_SIZE = 8; 
+const int READING_BUFFER_SIZE = 3;   
+const int PROCESSING_BUFFER_SIZE = 2; 
 const int VIDEO_SAVE_BUFFER_SIZE = 100;  // 🔥 Large buffer for async video saving
 
 // Inter-thread queues
@@ -105,6 +105,11 @@ std::atomic<long long> g_wait_processing_not_full_cnt{0};
 std::atomic<long long> g_wait_processing_not_empty_ms{0};
 std::atomic<long long> g_wait_processing_not_empty_cnt{0};
 }
+
+// Overall FPS 口径：从“第一帧成功读入时刻”到“最后一帧显示/输出时刻”的有效区间
+std::atomic<bool> g_overall_first_seen{false};
+std::atomic<std::chrono::steady_clock::time_point> g_overall_first_ts{std::chrono::steady_clock::now()};
+std::atomic<std::chrono::steady_clock::time_point> g_overall_last_ts{std::chrono::steady_clock::now()};
 
 MultiThreadTrackingApp::MultiThreadTrackingApp(
     const std::string& global_model_path, 
@@ -290,6 +295,9 @@ void MultiThreadTrackingApp::run() {
     displayed_frames_count = 0;
     last_process_time = std::chrono::steady_clock::now();
     last_display_time = std::chrono::steady_clock::now();
+    g_overall_first_seen = false;
+    g_overall_first_ts = std::chrono::steady_clock::now();
+    g_overall_last_ts = g_overall_first_ts.load();
     
     // Reset frame order validation
     last_processed_frame_number = -1;
@@ -394,10 +402,17 @@ void MultiThreadTrackingApp::run() {
     
     // Only output standardized FPS at the summary below
 
-    // ==== Unified FPS Summary (for overall pipeline FPS) ====
-    double pipeline_fps = (total_time_s > 0.0 && actual_processed_frames > 0)
-                              ? (actual_processed_frames.load() / total_time_s)
-                              : 0.0; // full pipeline throughput
+    // ==== Unified FPS Summary (Overall 口径：从第一帧成功读入到最后一帧显示) ====
+    double pipeline_fps = 0.0;
+    if (g_overall_first_seen.load() && actual_processed_frames > 1) {
+        auto t0 = g_overall_first_ts.load();
+        auto t1 = g_overall_last_ts.load();
+        auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        if (dur_ms > 0) pipeline_fps = (actual_processed_frames.load() * 1000.0) / dur_ms;
+    } else if (total_time_s > 0.0 && actual_processed_frames > 0) {
+        // 回退：用run()内start_time口径（可能包含线程启动/收尾）
+        pipeline_fps = (actual_processed_frames.load() / total_time_s);
+    }
     double avg_proc_ms_final = (actual_processed_frames > 0)
                                    ? (static_cast<double>(total_process_time_ms.load()) / actual_processed_frames.load())
                                    : 0.0;
@@ -654,56 +669,7 @@ void MultiThreadTrackingApp::videoReaderThread() {
             continue;
         }
         
-        // Adaptive input rate control (no frame drop):
-        // - Estimate desired interval by real_processing_fps/avg_process_time
-        // - Apply short sleeps when backlog exceeds budget to avoid queue bloat
-        {
-            // Estimate per-frame processing time
-            double avg_proc_ms = 0.0;
-            int processed = std::max(1, actual_processed_frames.load());
-            long long proc_sum = total_process_time_ms.load();
-            if (proc_sum > 0) {
-                avg_proc_ms = static_cast<double>(proc_sum) / processed;
-            }
-            if (avg_proc_ms <= 0.0) {
-                // Fallback to runtime processing FPS
-                double rpfps = real_processing_fps.load();
-                if (rpfps > 0.0) avg_proc_ms = 1000.0 / rpfps;
-            }
-            if (avg_proc_ms <= 0.0) {
-                avg_proc_ms = 30.0; // last resort
-            }
-
-            // Adaptive throttling based on processing capacity (for all sources)
-            double desired_interval_ms = avg_proc_ms * THROTTLE_SAFETY;
-            auto now_tick = std::chrono::steady_clock::now();
-            auto since_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_tick - last_read_tick).count();
-            if (since_last_ms < desired_interval_ms) {
-                auto sleep_ms = static_cast<long long>(desired_interval_ms - since_last_ms);
-                if (sleep_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(std::min<long long>(sleep_ms, 5)));
-            }
-
-            // Estimated backlog latency = (readQ + procQ) * avg_proc_ms
-            size_t read_q_size = 0;
-            size_t proc_q_size = 0;
-            {
-                std::lock_guard<std::mutex> lk(reading_mutex);
-                read_q_size = reading_queue.size();
-            }
-            {
-                std::lock_guard<std::mutex> lk(processing_mutex);
-                proc_q_size = processing_queue.size();
-            }
-            double est_backlog_ms = (read_q_size + proc_q_size) * avg_proc_ms;
-            if (est_backlog_ms > TARGET_LATENCY_BUDGET_MS) {
-                // Backoff proportionally with a small cap
-                double over_ms = est_backlog_ms - TARGET_LATENCY_BUDGET_MS;
-                long long backoff_ms = static_cast<long long>(std::min(over_ms * 0.25, 10.0)); // max 10ms
-                if (backoff_ms > 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-                }
-            }
-        }
+        // 读取端不再进行自适应节流，完全依赖队列背压（不丢帧）。
         
         {
             // Wait for space in read queue
@@ -782,6 +748,11 @@ void MultiThreadTrackingApp::videoReaderThread() {
                         qitem.source_pts_ms = video_reader_->getLastFramePtsMs();
                         qitem.upstream_latency_ms = video_reader_->getLastUpstreamLatencyMs();
                     }
+                }
+                // 标记Overall开始时刻：第一帧成功读入
+                if (!g_overall_first_seen.load()) {
+                    g_overall_first_ts = now;
+                    g_overall_first_seen = true;
                 }
                 // Always enqueue all frames (no dropping for deterministic processing)
                 reading_queue.push(std::move(qitem));  // Move semantics to avoid二次拷贝
@@ -1090,6 +1061,7 @@ void MultiThreadTrackingApp::resultDisplayThread() {
 
             // True end-to-end latency (read to display)
             auto now = std::chrono::steady_clock::now();
+            g_overall_last_ts = now; // 标记Overall结束时刻：最后一次显示/输出
             auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.read_timestamp).count();
             total_delay_ms += delay;
             // Keep continuity (no drop)

@@ -23,41 +23,98 @@ bool GStreamerVideoReader::open(const std::string& filename) {
     if (is_v4l2) {
         std::string dev = filename;
         if (isDigits(filename)) dev = "/dev/video" + filename;
-        // Low latency and no drop: appsink sync=false max-buffers=2 drop=false; ensure output BGR, avoid extra SWS
-        pipeline =
-            "v4l2src device=" + dev +
-            " io-mode=2 ! decodebin ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=2 drop=false";
+        // 多候选管线：优先 dma-buf，再回退到 mmap；引入 queue 并增大 appsink 缓冲，严格 drop=false（不丢帧）
+        std::vector<std::string> candidates;
+        candidates.push_back(
+            std::string("v4l2src device=") + dev +
+            " io-mode=4 ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! decodebin ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        candidates.push_back(
+            std::string("v4l2src device=") + dev +
+            " io-mode=2 ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! decodebin ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+
+        bool opened = false;
+        for (const auto& p : candidates) {
+            LOG_INFO("GStreamer pipeline: " << p);
+            cap.open(p, cv::CAP_GSTREAMER);
+            if (cap.isOpened()) {
+                pipeline = p;
+                opened = true;
+                break;
+            }
+        }
+        if (!opened) {
+            LOG_ERROR("Cannot use GStreamer open v4l2 source: " << dev);
+            return false;
+        }
     } else if (filename.rfind("rtsp://", 0) == 0 || filename.rfind("rtsps://", 0) == 0) {
-        pipeline =
-            "rtspsrc location=\"" + filename +
-            "\" latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=2 drop=false";
+        // RTSP：优先硬解（NVDEC/VAAPI），TCP 传输，较低 latency；appsink 不丢帧
+        std::vector<std::string> candidates;
+        // NVDEC
+        candidates.push_back(
+            std::string("rtspsrc location=\"") + filename +
+            "\" protocols=tcp latency=50 drop-on-latency=false do-timestamp=true ! rtph264depay ! h264parse ! nvh264dec ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        // VAAPI
+        candidates.push_back(
+            std::string("rtspsrc location=\"") + filename +
+            "\" protocols=tcp latency=50 drop-on-latency=false do-timestamp=true ! rtph264depay ! h264parse ! vaapih264dec ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        // CPU 解码
+        candidates.push_back(
+            std::string("rtspsrc location=\"") + filename +
+            "\" protocols=tcp latency=50 drop-on-latency=false do-timestamp=true ! rtph264depay ! h264parse ! avdec_h264 ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+
+        bool opened = false;
+        for (const auto& p : candidates) {
+            LOG_INFO("GStreamer pipeline: " << p);
+            cap.open(p, cv::CAP_GSTREAMER);
+            if (cap.isOpened()) {
+                pipeline = p;
+                opened = true;
+                break;
+            }
+        }
+        if (!opened) {
+            LOG_ERROR("Cannot use GStreamer open RTSP: " << filename);
+            return false;
+        }
     } else {
         // Local file (mp4/mov etc.): try multiple pipelines in order to improve compatibility
         std::vector<std::string> candidates;
-        // 1) uridecodebin
+        // 1) uridecodebin（自动解码）
         candidates.push_back(
             std::string("uridecodebin uri=\"file://") + filename +
-            "\" ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=2 drop=false");
-        // 2) filesrc+decodebin
+            "\" ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        // 2) filesrc+decodebin（显式 filesrc）
         candidates.push_back(
             std::string("filesrc location=\"") + filename +
-            "\" ! decodebin ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=2 drop=false");
+            "\" ! decodebin ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
         // 3) filesrc+qtdemux -> mpeg4videoparse -> avdec_mpeg4 (mp4v/MPEG-4 SP/ASP)
         candidates.push_back(
             std::string("filesrc location=\"") + filename +
-            "\" ! qtdemux name=demux demux.video_0 ! queue ! mpeg4videoparse ! avdec_mpeg4 ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=2 drop=false");
+            "\" ! qtdemux name=demux demux.video_0 ! queue ! mpeg4videoparse ! avdec_mpeg4 ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
         // 4) filesrc+qtdemux -> decodebin (explicit demux)
         candidates.push_back(
             std::string("filesrc location=\"") + filename +
-            "\" ! qtdemux name=demux demux.video_0 ! queue ! decodebin ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=2 drop=false");
-        // 5) H.264 explicit decode chain
+            "\" ! qtdemux name=demux demux.video_0 ! queue ! decodebin ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        // 5) H.264 explicit decode chain（优先 NVDEC/VAAPI，再回退 CPU）
         candidates.push_back(
             std::string("filesrc location=\"") + filename +
-            "\" ! qtdemux name=demux demux.video_0 ! queue ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=2 drop=false");
-        // 6) H.265/HEVC explicit decode chain
+            "\" ! qtdemux name=demux demux.video_0 ! queue ! h264parse ! nvh264dec ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
         candidates.push_back(
             std::string("filesrc location=\"") + filename +
-            "\" ! qtdemux name=demux demux.video_0 ! queue ! h265parse ! avdec_h265 ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=2 drop=false");
+            "\" ! qtdemux name=demux demux.video_0 ! queue ! h264parse ! vaapih264dec ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        candidates.push_back(
+            std::string("filesrc location=\"") + filename +
+            "\" ! qtdemux name=demux demux.video_0 ! queue ! h264parse ! avdec_h264 ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        // 6) H.265/HEVC explicit decode chain（优先 NVDEC/VAAPI，再回退 CPU）
+        candidates.push_back(
+            std::string("filesrc location=\"") + filename +
+            "\" ! qtdemux name=demux demux.video_0 ! queue ! h265parse ! nvh265dec ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        candidates.push_back(
+            std::string("filesrc location=\"") + filename +
+            "\" ! qtdemux name=demux demux.video_0 ! queue ! h265parse ! vaapih265dec ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
+        candidates.push_back(
+            std::string("filesrc location=\"") + filename +
+            "\" ! qtdemux name=demux demux.video_0 ! queue ! h265parse ! avdec_h265 ! queue ! videoconvert ! video/x-raw,format=BGR ! appsink sync=false max-buffers=16 drop=false enable-last-sample=false");
 
         bool opened = false;
         for (const auto& p : candidates) {

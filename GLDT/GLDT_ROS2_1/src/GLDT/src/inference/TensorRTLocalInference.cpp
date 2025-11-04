@@ -821,50 +821,48 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::executeBatchInferenc
         }
         extra_output_buffers.clear();
         
-        auto copy_start = std::chrono::high_resolution_clock::now();
-        // 🔥 Copy output data to CPU
-        const int total_output_size = batch_size * output_size_;
-        std::vector<float> batch_output_host(total_output_size);
-        cudaMemcpyAsync(batch_output_host.data(), batch_ctx_->output_buffer, 
-                        total_output_size * sizeof(float), 
-                        cudaMemcpyDeviceToHost, stream_);
-        
-        cudaStreamSynchronize(stream_);
-        auto copy_end = std::chrono::high_resolution_clock::now();
-        double copy_time = std::chrono::duration<double, std::milli>(copy_end - copy_start).count();
-        
-        if (FLAGS_log_batch_timing) {
-            LOG_INFO("⏱️  [批量推理时间-拷贝] batch=" << batch_size << ", GPU->CPU拷贝=" << copy_time << "ms");
-        }
-        
+        // 后处理阶段
         auto postprocess_start = std::chrono::high_resolution_clock::now();
         
-        // Batch postprocess - use CPU or GPU based on the selected postprocess mode
         if (postprocess_mode_ == PostprocessMode::GPU) {
-            // Local detection GPU postprocess directly use serial mode, process each sample
+            // 直接在设备端解析，避免整批GPU->CPU拷贝
             results.resize(batch_size);
-            
+            float* d_base_output = static_cast<float*>(batch_ctx_->output_buffer);
+            float used_nms = static_cast<float>(FLAGS_local_nms_threshold);
+            used_nms = std::max(0.3f, std::min(0.7f, used_nms));
             try {
-                for (int b = 0; b < batch_size; b++) {
-                    // Calculate the output pointer and size of the current sample
-                    float* output = batch_output_host.data() + b * output_size_;
-                    
-                    // Use GPU postprocess for single sample
-                    results[b] = gpu::parseLocalYOLOOutputGPU(
-                        output, output_size_, batch_images[b], conf_threshold);
-                        
-                    // Ensure CUDA synchronization, avoid memory interference between multiple samples
-                    cudaDeviceSynchronize();
-                    
-                    // Clean up CUDA memory
-                    cudaFree(0);
+                for (int b = 0; b < batch_size; ++b) {
+                    float* d_output = d_base_output + b * output_size_;
+                    results[b] = gpu::parseLocalYOLOOutputGPUFromDevice(
+                        d_output, output_size_, batch_images[b], conf_threshold, used_nms, stream_);
                 }
+                // 保守：保证本批次解析完成
+                cudaStreamSynchronize(stream_);
             } catch (const std::exception& e) {
-                LOG_ERROR("Local model GPU batch postprocess failed, fallback to CPU: " << e.what());
+                LOG_ERROR("Local model GPU device postprocess failed, fallback to CPU: " << e.what());
+                // 回退方案：仅在需要CPU后处理时进行一次性D2H拷贝
+                const int total_output_size = batch_size * output_size_;
+                std::vector<float> batch_output_host(total_output_size);
+                cudaMemcpyAsync(batch_output_host.data(), batch_ctx_->output_buffer,
+                                total_output_size * sizeof(float),
+                                cudaMemcpyDeviceToHost, stream_);
+                cudaStreamSynchronize(stream_);
                 results = postprocessBatch(batch_output_host.data(), batch_images, conf_threshold);
             }
         } else {
-            // Use CPU batch postprocess
+            // CPU后处理：仅在此路径进行D2H拷贝
+            const int total_output_size = batch_size * output_size_;
+            std::vector<float> batch_output_host(total_output_size);
+            auto copy_start = std::chrono::high_resolution_clock::now();
+            cudaMemcpyAsync(batch_output_host.data(), batch_ctx_->output_buffer,
+                            total_output_size * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream_);
+            cudaStreamSynchronize(stream_);
+            auto copy_end = std::chrono::high_resolution_clock::now();
+            double copy_time = std::chrono::duration<double, std::milli>(copy_end - copy_start).count();
+            if (FLAGS_log_batch_timing) {
+                LOG_INFO("⏱️  [批量推理时间-拷贝] batch=" << batch_size << ", GPU->CPU拷贝=" << copy_time << "ms");
+            }
             results = postprocessBatch(batch_output_host.data(), batch_images, conf_threshold);
         }
         
@@ -884,10 +882,12 @@ std::vector<std::vector<Detection>> TensorRTLocalInference::executeBatchInferenc
         
         if (FLAGS_log_batch_timing) {
             LOG_INFO("⏱️  [批量推理时间-后处理] batch=" << batch_size << ", 后处理=" << postprocess_time << "ms");
+            // 在GPU后处理路径中不再有整批D2H拷贝，拷贝时间记为0
+            double copy_time_report = (postprocess_mode_ == PostprocessMode::GPU) ? 0.0 : 0.0; // 已在CPU路径打印
             LOG_INFO("⏱️  [批量推理时间-总计] batch=" << batch_size 
                      << ", 前处理=" << preprocess_time << "ms"
                      << ", 推理=" << inference_time << "ms"
-                     << ", 拷贝=" << copy_time << "ms"
+                     << ", 拷贝=" << copy_time_report << "ms"
                      << ", 后处理=" << postprocess_time << "ms"
                      << ", 总计=" << total_time << "ms"
                      << ", 检测数=" << total_detections 
