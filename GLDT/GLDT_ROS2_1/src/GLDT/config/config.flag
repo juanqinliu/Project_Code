@@ -10,7 +10,7 @@
 # Enable saving output video with tracking overlays
 --enable_video_output=false
 # Enable on-screen display (imshow/waitKey/overlay).
---enable_display=true
+--enable_display=false
 # single_thread_mode or multithreaded mode
 --single_thread_mode=false
 
