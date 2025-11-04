@@ -603,6 +603,158 @@ std::vector<Detection> parseLocalYOLOOutputGPU(
     return detections;
 }
 
+// 直接从设备端输出解析，避免整块GPU->CPU拷贝
+std::vector<Detection> parseLocalYOLOOutputGPUFromDevice(
+    float* d_output,
+    int output_size,
+    const cv::Mat& original_image,
+    float conf_threshold,
+    float nms_threshold,
+    cudaStream_t stream
+) {
+    std::vector<Detection> detections;
+
+    // 记录需要释放的设备内存
+    std::vector<void*> allocated_memory;
+
+    try {
+        if (d_output == nullptr) {
+            LOG_ERROR("Local YOLO device output pointer is null");
+            return detections;
+        }
+        if (output_size <= 0) {
+            LOG_ERROR("Invalid output size of local YOLO: " << output_size);
+            return detections;
+        }
+        if (original_image.empty()) {
+            LOG_ERROR("Original image is empty");
+            return detections;
+        }
+
+        int num_boxes = output_size / kBoxInfoSize;
+        int max_detections = std::min(std::min(num_boxes, kLocalMaxDetections), 50);
+
+        // 为有效框/计数分配设备内存
+        float* d_valid_boxes = nullptr;
+        int* d_valid_count = nullptr;
+        cudaError_t err = cudaMalloc(&d_valid_boxes, max_detections * 5 * sizeof(float));
+        if (err != cudaSuccess) {
+            LOG_ERROR("Local detection GPU memory allocation failed (d_valid_boxes): " << cudaGetErrorString(err));
+            throw std::runtime_error("GPU memory allocation failed");
+        }
+        allocated_memory.push_back(d_valid_boxes);
+        CUDA_CHECK(cudaMemsetAsync(d_valid_boxes, 0, max_detections * 5 * sizeof(float), stream));
+
+        int zero = 0;
+        err = cudaMalloc(&d_valid_count, sizeof(int));
+        if (err != cudaSuccess) {
+            LOG_ERROR("Local detection GPU memory allocation failed (d_valid_count): " << cudaGetErrorString(err));
+            throw std::runtime_error("GPU memory allocation failed");
+        }
+        allocated_memory.push_back(d_valid_count);
+        CUDA_CHECK(cudaMemcpyAsync(d_valid_count, &zero, sizeof(int), cudaMemcpyHostToDevice, stream));
+
+        // 提取有效检测（直接使用设备端输出）
+        int block_size = 128;
+        int grid_size = (num_boxes + block_size - 1) / block_size;
+        if (grid_size > 1000) grid_size = 1000;
+
+        extractLocalDetectionsKernel<<<grid_size, block_size, 0, stream>>>(
+            d_output, num_boxes, conf_threshold, d_valid_boxes, d_valid_count, max_detections);
+        CUDA_CHECK(cudaGetLastError());
+
+        // 拷回有效框数量
+        int valid_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&valid_count, d_valid_count, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        valid_count = std::min(valid_count, max_detections);
+        if (valid_count <= 0) {
+            // 释放内存
+            for (void* ptr : allocated_memory) { if (ptr) cudaFree(ptr); }
+            return detections;
+        }
+
+        // 拷回有效框 (x,y,w,h,conf)
+        std::vector<float> h_valid_boxes(valid_count * 5);
+        CUDA_CHECK(cudaMemcpyAsync(h_valid_boxes.data(), d_valid_boxes, valid_count * 5 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // 拆分出 boxes 和 scores
+        std::vector<float> boxes(valid_count * 4);
+        std::vector<float> scores(valid_count);
+        int keep = 0;
+        for (int i = 0; i < valid_count; ++i) {
+            float x = h_valid_boxes[i*5 + 0];
+            float y = h_valid_boxes[i*5 + 1];
+            float w = h_valid_boxes[i*5 + 2];
+            float h = h_valid_boxes[i*5 + 3];
+            float conf = h_valid_boxes[i*5 + 4];
+            if (w <= 0 || h <= 0 || w > kInputW || h > kInputH || w/h > 20 || h/w > 20) continue;
+            boxes[keep*4 + 0] = x;
+            boxes[keep*4 + 1] = y;
+            boxes[keep*4 + 2] = w;
+            boxes[keep*4 + 3] = h;
+            scores[keep] = conf;
+            keep++;
+        }
+        if (keep == 0) {
+            for (void* ptr : allocated_memory) { if (ptr) cudaFree(ptr); }
+            return detections;
+        }
+        boxes.resize(keep * 4);
+        scores.resize(keep);
+
+        // 坐标转换到原图尺度（使用现有GPU函数，内部会同步）
+        float* d_boxes_xyxy = nullptr;
+        err = cudaMalloc(&d_boxes_xyxy, keep * 4 * sizeof(float));
+        if (err != cudaSuccess) {
+            LOG_ERROR("Local detection GPU memory allocation failed (d_boxes_xyxy): " << cudaGetErrorString(err));
+            throw std::runtime_error("GPU memory allocation failed");
+        }
+        allocated_memory.push_back(d_boxes_xyxy);
+        CUDA_CHECK(cudaMemcpyAsync(d_boxes_xyxy, boxes.data(), keep * 4 * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+        // 复用已有转换（使用默认流同步），精度上无影响；如需进一步优化，可改为带stream版本
+        transformLocalBoxesGPU(d_boxes_xyxy, keep, original_image, kInputW, kInputH);
+
+        // 拷回转换后的坐标
+        CUDA_CHECK(cudaMemcpyAsync(boxes.data(), d_boxes_xyxy, keep * 4 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // GPU NMS（现有实现使用默认流并设备同步）
+        std::vector<int> indices(keep);
+        int num_after_nms = 0;
+        localNmsGPU(boxes.data(), scores.data(), indices.data(), num_after_nms, keep, nms_threshold);
+
+        detections.reserve(num_after_nms);
+        for (int i = 0; i < keep; ++i) {
+            if (indices[i] == -1) continue;
+            int bi = indices[i];
+            float x1 = boxes[bi*4 + 0];
+            float y1 = boxes[bi*4 + 1];
+            float x2 = boxes[bi*4 + 2];
+            float y2 = boxes[bi*4 + 3];
+            if (x1 < 0 || y1 < 0 || x2 <= x1 || y2 <= y1) continue;
+            if (x2 > original_image.cols || y2 > original_image.rows) continue;
+            Detection det;
+            det.bbox = cv::Rect2f(x1, y1, x2 - x1, y2 - y1);
+            det.confidence = scores[bi];
+            det.class_id = 0;
+            det.is_from_global_model = false;
+            detections.push_back(det);
+        }
+
+    } catch (const std::exception& e) {
+        LOG_ERROR("Local detection GPU device-parse failed: " << e.what());
+    }
+
+    for (void* ptr : allocated_memory) {
+        if (ptr) cudaFree(ptr);
+    }
+
+    return detections;
+}
+
 // Batch process local YOLO output and execute NMS on GPU
 std::vector<std::vector<Detection>> batchDecodeLocalYOLOOutputGPU(
     float* batch_output,
