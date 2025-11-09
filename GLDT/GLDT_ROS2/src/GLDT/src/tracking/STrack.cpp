@@ -1,5 +1,6 @@
 #include "tracking/STrack.h"
 #include <algorithm>
+#include <cmath>
 #include <opencv2/ml.hpp>
 
 namespace tracking {
@@ -11,7 +12,7 @@ int STrack::temp_id_counter_ = 1;
 STrack::STrack(cv::Rect2f tlwh_val, float score_val, int cls) 
     : tlwh(tlwh_val), score(score_val), class_id(cls), roi_id(-1),
       is_activated(false), is_real_target(false), frame_id(0), tracklet_len(0), 
-      start_frame(0), state(New), lost_frames_count(0),
+      start_frame(0), state(New), lost_frames_count(0), miss_count_in_grace(0),
       quality_score(score_val), roi_miss_count(0), spatial_confidence(1.0f),
       is_recovered(false), recovery_confidence(0.0f),
       is_confirmed(false), confirmation_frames(0), min_confirmation_frames(3),
@@ -92,8 +93,14 @@ void STrack::activate(int frame_id) {
 
 cv::Point2f STrack::center() const {
     // If Kalman filter is initialized, use the filter's state
-    if (kf_initialized_ && !kf_mean_.empty()) {
-        return cv::Point2f(kf_mean_.at<float>(0), kf_mean_.at<float>(1));
+    if (kf_initialized_ && !kf_mean_.empty() && kf_mean_.rows >= 2) {
+        float x = kf_mean_.at<float>(0);
+        float y = kf_mean_.at<float>(1);
+        
+        // ✅ Validate values before returning
+        if (std::isfinite(x) && std::isfinite(y)) {
+            return cv::Point2f(x, y);
+        }
     }
     
     // Otherwise, use the center of the bounding box
@@ -102,10 +109,14 @@ cv::Point2f STrack::center() const {
 
 cv::Point2f STrack::getPredictedCenter() const {
     // If Kalman filter is initialized, use the filter's predicted state
-    if (kf_initialized_ && !kf_mean_.empty()) {
-        // Return predicted position plus velocity
-        return cv::Point2f(kf_mean_.at<float>(0) + kf_mean_.at<float>(4), 
-                           kf_mean_.at<float>(1) + kf_mean_.at<float>(5));
+    if (kf_initialized_ && !kf_mean_.empty() && kf_mean_.rows >= 6) {
+        float x = kf_mean_.at<float>(0) + kf_mean_.at<float>(4);
+        float y = kf_mean_.at<float>(1) + kf_mean_.at<float>(5);
+        
+        // ✅ Validate predicted values
+        if (std::isfinite(x) && std::isfinite(y)) {
+            return cv::Point2f(x, y);
+        }
     }
     
     // If Kalman filter is not initialized, use simple linear prediction
@@ -130,6 +141,15 @@ void STrack::predict() {
         // Use Kalman filter to predict
         auto [mean, covariance] = predictKalman();
         
+        // ✅ Validate Kalman filter output
+        if (mean.empty() || mean.rows < 4 || mean.cols < 1) {
+            // LOG_WARN("Invalid Kalman mean matrix, marking track as removed");
+            state = Removed;
+            // Set tlwh to zero to indicate invalid state
+            tlwh = cv::Rect2f(0, 0, 0, 0);
+            return;
+        }
+        
         // Update state
         kf_mean_ = mean;
         kf_covariance_ = covariance;
@@ -140,8 +160,20 @@ void STrack::predict() {
         float w = mean.at<float>(2);
         float h = mean.at<float>(3);
         
-        w = std::max(0.1f, w);
-        h = std::max(0.1f, h);
+        // ✅ Validate numerical values
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w) || !std::isfinite(h)) {
+            // LOG_WARN("Invalid predicted values detected: x=" << x << ", y=" << y << ", w=" << w << ", h=" << h);
+            // Mark track as invalid
+            state = Removed;
+            return;
+        }
+        
+        // ✅ Clamp values to reasonable ranges
+        w = std::max(0.1f, std::min(w, 5000.0f));
+        h = std::max(0.1f, std::min(h, 5000.0f));
+        x = std::max(-5000.0f, std::min(x, 10000.0f));
+        y = std::max(-5000.0f, std::min(y, 10000.0f));
+        
         tlwh = cv::Rect2f(x - w/2, y - h/2, w, h);
     } else {
         // If Kalman filter is not initialized, use simple linear prediction
@@ -196,7 +228,8 @@ void STrack::update(const cv::Rect2f& new_tlwh, float new_score, int new_frame_i
     score = new_score;
     frame_id = new_frame_id;
     tracklet_len++;
-    lost_frames_count = 0; 
+    lost_frames_count = 0;
+    miss_count_in_grace = 0;  // 重置grace period计数器 
     
 
     quality_score = (quality_score * 0.8f + new_score * 0.2f); 
@@ -354,12 +387,24 @@ void STrack::initiateKalman(const cv::Rect2f& measurement) {
 }
 
 std::pair<cv::Mat, cv::Mat> STrack::predictKalman() {
+    // ✅ Validate Kalman filter state before prediction
+    if (kf_mean_.empty() || kf_covariance_.empty() || 
+        kf_mean_.rows < 8 || kf_covariance_.rows < 8) {
+        // Return empty matrices to signal error
+        return {cv::Mat(), cv::Mat()};
+    }
+    
     // Predict step
     cv::Mat mean = kf_mean_.clone();
     cv::Mat covariance = kf_covariance_.clone();
     
     float w = mean.at<float>(2);
     float h = mean.at<float>(3);
+    
+    // ✅ Validate width and height
+    if (!std::isfinite(w) || !std::isfinite(h) || w <= 0 || h <= 0) {
+        return {cv::Mat(), cv::Mat()};
+    }
 
     float std_pos_x = kf_std_weight_position_ * w;
     float std_pos_y = kf_std_weight_position_ * h;

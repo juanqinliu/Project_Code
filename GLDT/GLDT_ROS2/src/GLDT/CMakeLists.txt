@@ -142,7 +142,12 @@ endif()
 pkg_check_modules(FMT fmt)
 if(FMT_FOUND)
     message(STATUS "Found fmt: ${FMT_VERSION}")
+    message(STATUS "FMT_INCLUDE_DIRS: ${FMT_INCLUDE_DIRS}")
+    message(STATUS "FMT_LIBRARY_DIRS: ${FMT_LIBRARY_DIRS}")
+    message(STATUS "FMT_LIBRARIES: ${FMT_LIBRARIES}")
     add_definitions(-DWITH_FMT)
+    include_directories(${FMT_INCLUDE_DIRS})
+    link_directories(${FMT_LIBRARY_DIRS})
 else()
     message(STATUS "fmt not found, trying to find with find_package")
     find_package(fmt QUIET)
@@ -303,8 +308,14 @@ set(LINK_LIBS
     gflags
     cuda_lib
     stdc++fs  # Add support for std::filesystem in GCC-8
-    fmt  # Link fmt static library directly
 )
+
+# Add fmt library if found
+if(FMT_FOUND)
+    list(APPEND LINK_LIBS ${FMT_LIBRARIES})
+elseif(fmt_FOUND)
+    list(APPEND LINK_LIBS fmt::fmt)
+endif()
 
 # Only append link if NVML library is found
 if(NVML_LIBRARY)

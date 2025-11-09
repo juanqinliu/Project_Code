@@ -17,32 +17,32 @@ namespace fs = std::filesystem;
 namespace tracking {
 
 // Static members initialization
-const int READING_BUFFER_SIZE = 10;   
-const int PROCESSING_BUFFER_SIZE = 8; 
-const int VIDEO_SAVE_BUFFER_SIZE = 100;  // 🔥 Large buffer for async video saving
+const int READING_BUFFER_SIZE = 3;   
+const int PROCESSING_BUFFER_SIZE = 2; 
+const int VIDEO_SAVE_BUFFER_SIZE = 100;  
 
 // Inter-thread queues
 std::queue<FrameItem> reading_queue;
 std::queue<ProcessedItem> processing_queue;
-std::queue<VideoSaveItem> video_save_queue;  // 🔥 Async video save queue
+std::queue<VideoSaveItem> video_save_queue; 
 
 // Mutexes
 std::mutex reading_mutex;
 std::mutex processing_mutex;
-std::mutex video_save_mutex;  // 🔥 Video save queue mutex
+std::mutex video_save_mutex;
 
 // Condition variables
 std::condition_variable reading_not_full;
 std::condition_variable reading_not_empty;
 std::condition_variable processing_not_full;
 std::condition_variable processing_not_empty;
-std::condition_variable video_save_not_full;   // 🔥 Video save queue not full
-std::condition_variable video_save_not_empty;  // 🔥 Video save queue not empty
+std::condition_variable video_save_not_full;
+std::condition_variable video_save_not_empty;
 
 // Thread control flags
 std::atomic<bool> video_finished(false);
 std::atomic<bool> processing_finished(false);
-std::atomic<bool> display_finished(false);  // 🔥 Display thread finished
+std::atomic<bool> display_finished(false);
 std::atomic<bool> should_exit(false);
 std::atomic<bool> is_paused(false);
 
@@ -58,24 +58,24 @@ std::atomic<TrackingMode> requested_mode(TrackingMode::GLOBAL);
 std::atomic<int> actual_processed_frames(0);
 std::atomic<double> video_fps(0.0);
 std::atomic<long long> total_delay_ms(0);
-std::atomic<long long> total_process_time_ms(0);  // total processing time (ms)
-std::atomic<long long> total_read_time_ms(0);     // total read interval time (ms)
-std::atomic<long long> total_display_time_ms(0);  // total display time (ms)
+std::atomic<long long> total_process_time_ms(0);
+std::atomic<long long> total_read_time_ms(0);
+std::atomic<long long> total_display_time_ms(0);
 
 // FPS counters (short-window for runtime stats)
-std::atomic<double> real_processing_fps(0.0);     // processing FPS (short window)
-std::atomic<double> real_display_fps(0.0);        // display FPS (short window)
-std::atomic<int> processed_frames_count(0);       // processed frame counter (window)
-std::atomic<int> displayed_frames_count(0);       // displayed frame counter (window)
+std::atomic<double> real_processing_fps(0.0);
+std::atomic<double> real_display_fps(0.0);
+std::atomic<int> processed_frames_count(0);
+std::atomic<int> displayed_frames_count(0);
 std::atomic<std::chrono::steady_clock::time_point> last_process_time{std::chrono::steady_clock::now()};
 std::atomic<std::chrono::steady_clock::time_point> last_display_time{std::chrono::steady_clock::now()};
 
 // Latency budget and throttle factor
-static constexpr int TARGET_LATENCY_BUDGET_MS = 80;   // end-to-end latency budget (ms)
-static constexpr double THROTTLE_SAFETY = 1.05;       // throttle safety factor
+static constexpr int TARGET_LATENCY_BUDGET_MS = 80;
+static constexpr double THROTTLE_SAFETY = 1.05;
 
-// Processing mode (always deterministic - no frame dropping)
-static constexpr int MAX_ACCEPTABLE_DELAY_MS = 200;     // max acceptable end-to-end delay for live
+// Processing mode: deterministic processing, no frame dropping
+static constexpr int MAX_ACCEPTABLE_DELAY_MS = 200;
 
 // Fine-grained read/display timings (cross-thread accumulation)
 namespace {
@@ -105,6 +105,11 @@ std::atomic<long long> g_wait_processing_not_full_cnt{0};
 std::atomic<long long> g_wait_processing_not_empty_ms{0};
 std::atomic<long long> g_wait_processing_not_empty_cnt{0};
 }
+
+// Overall FPS measurement: from first successful frame read to last frame display/output
+std::atomic<bool> g_overall_first_seen{false};
+std::atomic<std::chrono::steady_clock::time_point> g_overall_first_ts{std::chrono::steady_clock::now()};
+std::atomic<std::chrono::steady_clock::time_point> g_overall_last_ts{std::chrono::steady_clock::now()};
 
 MultiThreadTrackingApp::MultiThreadTrackingApp(
     const std::string& global_model_path, 
@@ -230,7 +235,7 @@ MultiThreadTrackingApp::~MultiThreadTrackingApp() {
 }
 
 void MultiThreadTrackingApp::run() {
-    // 🔥 Print startup banner (bypasses log_level)
+    // Print startup banner (bypasses log_level)
     std::cout << "\n========================================" << std::endl;
     std::cout << "  GLDT Tracking System Starting" << std::endl;
     std::cout << "========================================" << std::endl;
@@ -245,7 +250,7 @@ void MultiThreadTrackingApp::run() {
         return;
     }
     
-    // 🔥 Print video info (bypasses log_level)
+    // Print video info (bypasses log_level)
     std::cout << "Video Info: " << frame_width_ << "x" << frame_height_ 
               << " @ " << fps_ << " FPS" << std::endl;
     if (total_frames_ > 0) {
@@ -271,11 +276,10 @@ void MultiThreadTrackingApp::run() {
     // Record start time
     auto start_time = std::chrono::steady_clock::now();
     
-    // Reset flags and counters (but preserve should_exit from signal handler)
+    // Reset flags and counters (preserve should_exit from signal handler)
     video_finished = false;
     processing_finished = false;
-    display_finished = false;  // 🔥 Reset display finished flag
-    // Don't reset should_exit - it might be set by signal handler
+    display_finished = false;
     is_paused = false;
     actual_processed_frames = 0;
     total_delay_ms = 0;
@@ -290,6 +294,9 @@ void MultiThreadTrackingApp::run() {
     displayed_frames_count = 0;
     last_process_time = std::chrono::steady_clock::now();
     last_display_time = std::chrono::steady_clock::now();
+    g_overall_first_seen = false;
+    g_overall_first_ts = std::chrono::steady_clock::now();
+    g_overall_last_ts = g_overall_first_ts.load();
     
     // Reset frame order validation
     last_processed_frame_number = -1;
@@ -298,7 +305,7 @@ void MultiThreadTrackingApp::run() {
     // Clear queues
     while (!reading_queue.empty()) reading_queue.pop();
     while (!processing_queue.empty()) processing_queue.pop();
-    while (!video_save_queue.empty()) video_save_queue.pop();  // 🔥 Clear video save queue
+    while (!video_save_queue.empty()) video_save_queue.pop();
     
     // Start threads (video saver first, then processor/display, reader last)
     std::thread video_save_thread;
@@ -394,14 +401,21 @@ void MultiThreadTrackingApp::run() {
     
     // Only output standardized FPS at the summary below
 
-    // ==== Unified FPS Summary (for overall pipeline FPS) ====
-    double pipeline_fps = (total_time_s > 0.0 && actual_processed_frames > 0)
-                              ? (actual_processed_frames.load() / total_time_s)
-                              : 0.0; // full pipeline throughput
+    // Unified FPS Summary: from first successful frame read to last frame display
+    double pipeline_fps = 0.0;
+    if (g_overall_first_seen.load() && actual_processed_frames > 1) {
+        auto t0 = g_overall_first_ts.load();
+        auto t1 = g_overall_last_ts.load();
+        auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        if (dur_ms > 0) pipeline_fps = (actual_processed_frames.load() * 1000.0) / dur_ms;
+    } else if (total_time_s > 0.0 && actual_processed_frames > 0) {
+        // Fallback: use start_time from run() (may include thread startup/shutdown overhead)
+        pipeline_fps = (actual_processed_frames.load() / total_time_s);
+    }
     double avg_proc_ms_final = (actual_processed_frames > 0)
                                    ? (static_cast<double>(total_process_time_ms.load()) / actual_processed_frames.load())
                                    : 0.0;
-    double processing_fps = (avg_proc_ms_final > 0.0) ? (1000.0 / avg_proc_ms_final) : 0.0; // processing capacity
+    double processing_fps = (avg_proc_ms_final > 0.0) ? (1000.0 / avg_proc_ms_final) : 0.0;
     // Source FPS based on read intervals
     double source_fps_summary = 0.0;
     if (total_read_time_ms > 0 && g_read_interval_count > 0) {
@@ -411,7 +425,7 @@ void MultiThreadTrackingApp::run() {
     // Display FPS is a short-window stat; ignore if display disabled
     double display_actual_fps = real_display_fps.load();
 
-    // 🔥 Use std::cout for performance summary (bypasses log_level filtering, always visible)
+    // Use std::cout for performance summary (bypasses log_level filtering, always visible)
     std::cout << "\n================ Performance Summary ===============" << std::endl;
     std::cout << "Total Frames Processed: " << actual_processed_frames.load() << std::endl;
     std::cout << "Overall Average FPS: " << std::fixed << std::setprecision(1) << pipeline_fps << std::endl;
@@ -445,22 +459,11 @@ void MultiThreadTrackingApp::run() {
     std::cout << "====================================================\n" << std::endl;
 
 
-    if (actual_processed_frames > 0 && g_read_call_count > 0) {
-        double avg_read_interval = static_cast<double>(total_read_time_ms.load()) / actual_processed_frames.load();
-        double avg_read_call = static_cast<double>(g_read_call_time_ms.load()) / g_read_call_count.load();
-        // double backlog_wait = avg_read_interval - avg_read_call;
-        // double src_fps = (avg_read_interval > 0.0) ? (1000.0 / avg_read_interval) : 0.0;
-        // LOG_INFO("[Read Thread] Source Frame Interval: " << std::fixed << std::setprecision(3) << avg_read_interval
-        //          << " ms (Source FPS: " << std::fixed << std::setprecision(1) << src_fps
-        //          << "), Difference between read call and source frame interval (Scheduling/Driver): " << std::fixed << std::setprecision(3) << backlog_wait << " ms");
-    }
-    
-
     if (system_) {
         system_->saveResults(output_dir_, video_basename_);
     }
     
-    // 🔥 Output completion banner (bypasses log_level)
+    // Output completion banner (bypasses log_level)
     std::cout << "\n=============== Processing Completed ===============" << std::endl;
     // Output save path info
     std::string results_file_path = (fs::path(output_dir_) / (video_basename_ + ".txt")).string();
@@ -488,7 +491,7 @@ void MultiThreadTrackingApp::initializeOutputVideo() {
     LOG_INFO("Create Output Video: " << output_video_path_);
     int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
 
-    // 🔥 Always use original resolution for video saving (high quality output)
+    // Always use original resolution for video saving (high quality output)
     // Display downscaling only affects on-screen rendering, not saved video
     int out_w = frame_width_;
     int out_h = frame_height_;
@@ -509,20 +512,19 @@ void MultiThreadTrackingApp::initializeOutputVideo() {
 void MultiThreadTrackingApp::cleanup() {
     LOG_INFO("Cleanup Resources...");
     should_exit = true;
-    display_finished = true;  // Signal display finished
+    display_finished = true;
     
-    // Forcefully wake up all waiting threads
+    // Wake up all waiting threads
     reading_not_full.notify_all();
     reading_not_empty.notify_all();
     processing_not_full.notify_all();
     processing_not_empty.notify_all();
-    video_save_not_full.notify_all();   // Wake up video save thread
-    video_save_not_empty.notify_all();  // Wake up video save thread
+    video_save_not_full.notify_all();
+    video_save_not_empty.notify_all();
     
-    // Close video
     if (video_reader_) {
         video_reader_->close();
-        video_reader_.reset();  // Release smart pointer
+        video_reader_.reset();
     }
     
     if (video_writer_.isOpened()) {
@@ -530,9 +532,7 @@ void MultiThreadTrackingApp::cleanup() {
     }
 }
 
-//Video Reader Initialization Function
 bool MultiThreadTrackingApp::initializeVideoReader() {
-    // If the video reader already exists, return success
     if (video_reader_) {
         LOG_INFO("Video Reader Already Initialized");
         return true;
@@ -575,7 +575,6 @@ bool MultiThreadTrackingApp::initializeVideoReader() {
         if (std::find(try_order.begin(), try_order.end(), t) == try_order.end()) try_order.push_back(t);
     };
     push_unique(reader_type);
-    // Try other registered types as fallback
     push_unique(video::VideoReaderType::GSTREAMER);
     push_unique(video::VideoReaderType::FFMPEG);
     push_unique(video::VideoReaderType::OPENCV);
@@ -598,17 +597,13 @@ bool MultiThreadTrackingApp::initializeVideoReader() {
         return false;
     }
     
-    // Get original resolution for inference
     frame_width_ = video_reader_->getWidth();
     frame_height_ = video_reader_->getHeight();
-    
-    // Fetch additional info
     total_frames_ = video_reader_->getTotalFrames();
     fps_ = video_reader_->getFPS();
     
     LOG_INFO("Video info (for inference): " << frame_width_ << "x" << frame_height_
              << ", FPS=" << fps_ << ", Total frames=" << total_frames_);
-    // Display resolution if downscaling is enabled
     if (video_reader_->isDownscalingEnabled()) {
         auto target_res = video_reader_->getTargetResolution();
         LOG_INFO("Display downscaling: " << frame_width_ << "x" << frame_height_
@@ -626,11 +621,10 @@ bool MultiThreadTrackingApp::initializeVideoReader() {
 
 void MultiThreadTrackingApp::videoReaderThread() {
     LOG_INFO("Video reader thread started");
-    int frame_number = 0;  // 本地维护帧计数器，确保连续性
+    int frame_number = 0;  // Local frame counter to ensure continuity
     cv::Mat frame;
-    const int READ_LOG_INTERVAL = 30; // log every N frames
+    const int READ_LOG_INTERVAL = 30;
     
-    // Adaptive throttling: control read pace based on processing time
     auto last_read_tick = std::chrono::steady_clock::now();
     
     // Check video reader initialization
@@ -652,57 +646,6 @@ void MultiThreadTrackingApp::videoReaderThread() {
         if (is_paused) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
-        }
-        
-        // Adaptive input rate control (no frame drop):
-        // - Estimate desired interval by real_processing_fps/avg_process_time
-        // - Apply short sleeps when backlog exceeds budget to avoid queue bloat
-        {
-            // Estimate per-frame processing time
-            double avg_proc_ms = 0.0;
-            int processed = std::max(1, actual_processed_frames.load());
-            long long proc_sum = total_process_time_ms.load();
-            if (proc_sum > 0) {
-                avg_proc_ms = static_cast<double>(proc_sum) / processed;
-            }
-            if (avg_proc_ms <= 0.0) {
-                // Fallback to runtime processing FPS
-                double rpfps = real_processing_fps.load();
-                if (rpfps > 0.0) avg_proc_ms = 1000.0 / rpfps;
-            }
-            if (avg_proc_ms <= 0.0) {
-                avg_proc_ms = 30.0; // last resort
-            }
-
-            // Adaptive throttling based on processing capacity (for all sources)
-            double desired_interval_ms = avg_proc_ms * THROTTLE_SAFETY;
-            auto now_tick = std::chrono::steady_clock::now();
-            auto since_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_tick - last_read_tick).count();
-            if (since_last_ms < desired_interval_ms) {
-                auto sleep_ms = static_cast<long long>(desired_interval_ms - since_last_ms);
-                if (sleep_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(std::min<long long>(sleep_ms, 5)));
-            }
-
-            // Estimated backlog latency = (readQ + procQ) * avg_proc_ms
-            size_t read_q_size = 0;
-            size_t proc_q_size = 0;
-            {
-                std::lock_guard<std::mutex> lk(reading_mutex);
-                read_q_size = reading_queue.size();
-            }
-            {
-                std::lock_guard<std::mutex> lk(processing_mutex);
-                proc_q_size = processing_queue.size();
-            }
-            double est_backlog_ms = (read_q_size + proc_q_size) * avg_proc_ms;
-            if (est_backlog_ms > TARGET_LATENCY_BUDGET_MS) {
-                // Backoff proportionally with a small cap
-                double over_ms = est_backlog_ms - TARGET_LATENCY_BUDGET_MS;
-                long long backoff_ms = static_cast<long long>(std::min(over_ms * 0.25, 10.0)); // max 10ms
-                if (backoff_ms > 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-                }
-            }
         }
         
         {
@@ -749,7 +692,7 @@ void MultiThreadTrackingApp::videoReaderThread() {
         }
 
         auto read_call_start = std::chrono::steady_clock::now();
-        int reader_frame_number = 0;  // Frame number returned by VideoReader (only for debugging)
+        int reader_frame_number = 0;
         bool read_ok = video_reader_->readNextFrame(frame, reader_frame_number);
         auto read_call_end = std::chrono::steady_clock::now();
         g_read_call_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(read_call_end - read_call_start).count();
@@ -758,24 +701,23 @@ void MultiThreadTrackingApp::videoReaderThread() {
         {
             std::unique_lock<std::mutex> lock(reading_mutex);
             if (read_ok) {
-                // auto read_start_time = std::chrono::steady_clock::now();
                 auto now = std::chrono::steady_clock::now();
                 
                 // Compute read interval since last successful read
                 static auto last_read_time = now;
                 auto read_time = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_read_time).count();
-                if (frame_number > 0) {  // skip first frame (no previous timestamp)
+                if (frame_number > 0) {
                     total_read_time_ms += read_time;
                     g_read_interval_count++;
                 }
                 last_read_time = now;
-                last_read_tick = now; // throttling reference
+                last_read_tick = now;
                 
-                // Use locally maintained continuous frame number, ensure determinism
+                // Use locally maintained continuous frame number for determinism
                 tracking::FrameItem qitem;
-                qitem.frame = frame.clone();  // Deep copy to avoid multi-threading competition
-                qitem.frame_number = frame_number;  // Use locally maintained frame number
+                qitem.frame = frame.clone();
+                qitem.frame_number = frame_number;
                 qitem.timestamp = now;
                 if (video_reader_) {
                     if (video_reader_->supportsTimestamps()) {
@@ -783,16 +725,18 @@ void MultiThreadTrackingApp::videoReaderThread() {
                         qitem.upstream_latency_ms = video_reader_->getLastUpstreamLatencyMs();
                     }
                 }
-                // Always enqueue all frames (no dropping for deterministic processing)
-                reading_queue.push(std::move(qitem));  // Move semantics to avoid二次拷贝
+                // Mark overall start time: first successful frame read
+                if (!g_overall_first_seen.load()) {
+                    g_overall_first_ts = now;
+                    g_overall_first_seen = true;
+                }
+                reading_queue.push(std::move(qitem));
 
-                // Periodic read progress log
                 if (READ_LOG_INTERVAL > 0 && (frame_number % READ_LOG_INTERVAL == 0)) {
                     LOG_INFO("Read thread: got frame " << frame_number 
                              << " (reader frame: " << reader_frame_number << ")");
                 }
                 
-                // Increment locally maintained frame counter (ensure continuity)
                 frame_number++;
                 
                 // Notify processor there is a new frame
@@ -894,9 +838,9 @@ void MultiThreadTrackingApp::frameProcessorThread() {
             
             // Push result to processing queue
             ProcessedItem processed;
-            processed.frame = item.frame;  // cv::Mat copy (shallow copy, reference counting)
-            processed.vis_frame = std::move(vis_frame);  // Move semantics to avoid copy
-            processed.detections = std::move(detections);  // Move semantics to avoid copy
+            processed.frame = item.frame;
+            processed.vis_frame = std::move(vis_frame);
+            processed.detections = std::move(detections);
             processed.tracks = std::move(tracks);
             processed.frame_number = item.frame_number;
             processed.process_start_time = process_start_time;
@@ -904,8 +848,6 @@ void MultiThreadTrackingApp::frameProcessorThread() {
             processed.read_timestamp = item.timestamp;
             processed.source_pts_ms = item.source_pts_ms;
             processed.upstream_latency_ms = item.upstream_latency_ms;
-            
-            // Video saving will be handled synchronously in display thread for deterministic results
             
             {
                 auto t_lock_start = std::chrono::steady_clock::now();
@@ -943,8 +885,6 @@ void MultiThreadTrackingApp::frameProcessorThread() {
                 last_process_time = now;
                 processed_frames_count = 0;
             }
-
-            // No bypass: keep complete processing for each frame
         }
     }
     
@@ -1046,10 +986,9 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                 processing_queue.pop();
                 has_result = true;
                 
-                // Optimize: reduce log output frequency,降低开销
-                if (item.frame_number % 50 == 0) {  // Print every 50 frames
+                if (item.frame_number % 50 == 0) {
                     LOG_INFO("Display Thread: Process Frame " << item.frame_number 
-                            << "，Queue Remaining: " << processing_queue.size() 
+                            << ", Queue Remaining: " << processing_queue.size() 
                             << "/" << PROCESSING_BUFFER_SIZE);
                 }
                 
@@ -1078,21 +1017,12 @@ void MultiThreadTrackingApp::resultDisplayThread() {
             }
             last_displayed_frame_number = item.frame_number;
             
-            // Optimize: remove unnecessary lock check, reduce overhead
-            // If backlog is heavy, hint fast consumption
-            // {
-            //     std::lock_guard<std::mutex> lock(processing_mutex);
-            //     if (processing_queue.size() > PROCESSING_BUFFER_SIZE * 0.6) {
-            //         LOG_INFO("Queue backlog: size " << processing_queue.size() 
-            //                 << "/" << PROCESSING_BUFFER_SIZE << " frames");
-            //     }
-            // }
 
-            // True end-to-end latency (read to display)
+            // End-to-end latency (read to display)
             auto now = std::chrono::steady_clock::now();
+            g_overall_last_ts = now;  // Mark overall end time: last display/output
             auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.read_timestamp).count();
             total_delay_ms += delay;
-            // Keep continuity (no drop)
             
             // Detailed delay analysis (source PTS and upstream buffer)
             auto read_to_process = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1110,7 +1040,7 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                 end_to_end_from_pts = display_ms_since_zero - item.source_pts_ms;
             }
             
-            if (item.frame_number % 50 == 0) {  // log every 50 frames
+            if (item.frame_number % 50 == 0) {
                 LOG_INFO("Delay analysis frame " << item.frame_number << ": total=" << delay 
                          << "ms (read->process=" << read_to_process 
                          << "ms, process=" << process_time 
@@ -1119,7 +1049,6 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                          << (end_to_end_from_pts >= 0 ? (std::string(", PTS e2e est=") + std::to_string(end_to_end_from_pts) + "ms") : std::string())
                 );
                 
-                // Realtime high latency warning
                 if (delay > 500) {
                     LOG_WARNING("High latency warning: frame " << item.frame_number << " delay " << delay << "ms");
                 }
@@ -1134,14 +1063,13 @@ void MultiThreadTrackingApp::resultDisplayThread() {
             auto elapsed_display = std::chrono::duration_cast<std::chrono::milliseconds>(
                 current_time - last_display_time.load()).count();
             
-            // Update every 10 frames
             if (displayed_frames_count % 10 == 0 && elapsed_display > 0) {
                 real_display_fps = displayed_frames_count * 1000.0 / elapsed_display;
                 last_display_time = current_time;
                 displayed_frames_count = 0;
             }
             
-            // Maintain video_fps for compatibility (display refresh rate)
+            // Maintain video_fps for compatibility
             display_count++;
             auto elapsed_display_old = std::chrono::duration_cast<std::chrono::milliseconds>(
                 current_time - display_start_time).count();
@@ -1152,11 +1080,11 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                 display_count = 0;
             }
             
-            // Add overlay info to original frame first (for video saving)
+            // Add overlay info to original frame (for video saving)
             auto t_overlay_start = std::chrono::steady_clock::now();
             std::stringstream ss;
             
-            // Additional debug output: if verbose logging is enabled, print the confidence of the top-K detections of this frame
+            // Debug output: print top-K detection confidences if verbose logging enabled
             if (config_ && config_->verbose_logging) {
                 if (!item.detections.empty()) {
                     std::vector<float> confs;
@@ -1179,14 +1107,15 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                 }
             }
             
-            // Calculate Overall Average FPS (pipeline throughput)
+            // Calculate overall average FPS (pipeline throughput)
+            // Use global metrics instead of windowed display_count to avoid FPS=0 every 10 frames
             double overall_avg_fps = 0.0;
-            if (actual_processed_frames > 0) {
-                auto current_time = std::chrono::steady_clock::now();
-                auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    current_time - display_start_time).count();
-                if (elapsed_time > 0) {
-                    overall_avg_fps = (display_count * 1000.0) / elapsed_time;
+            if (g_overall_first_seen.load() && actual_processed_frames > 1) {
+                auto t0 = g_overall_first_ts.load();
+                auto t1 = std::chrono::steady_clock::now();
+                auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+                if (dur_ms > 0) {
+                    overall_avg_fps = (actual_processed_frames.load() * 1000.0) / dur_ms;
                 }
             }
             
@@ -1201,7 +1130,7 @@ void MultiThreadTrackingApp::resultDisplayThread() {
             g_disp_overlay_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_overlay_end - t_overlay_start).count();
             
             // Create downscaled version for display (if enabled)
-            cv::Mat vis_for_display = item.vis_frame;  // Default: use original
+            cv::Mat vis_for_display = item.vis_frame;
             if (video_reader_ && video_reader_->isDownscalingEnabled()) {
                 auto target = video_reader_->getTargetResolution();
                 if (target.first > 0 && target.second > 0) {
@@ -1212,10 +1141,8 @@ void MultiThreadTrackingApp::resultDisplayThread() {
             // Publish ROS2 messages (use downscaled version for bandwidth efficiency)
             if (enable_ros_publishing_ && ros2_node_) {
                 try {
-                    // Use Processing FPS for ROS message (reflects actual system processing capability)
                     double processing_fps_for_ros = real_processing_fps.load();
                     
-                    // Publish tracking results
                     ros2_node_->publishTrackingResult(
                         item.frame,  
                         item.detections, 
@@ -1224,7 +1151,6 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                         processing_fps_for_ros
                     );
                     
-                    // Publish visualization image (downscaled for ROS2 bandwidth)
                     ros2_node_->publishVisualizationImage(
                         vis_for_display, 
                         item.frame_number
@@ -1234,17 +1160,9 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                 }
             }
             
-            // Handle display and keys (if enable_display)
             if (FLAGS_enable_display) {
                 auto t_imshow_start = std::chrono::steady_clock::now();
                 cv::imshow("Tracking", vis_for_display);
-                // Optimize: remove unnecessary lock check
-                // {
-                //     std::lock_guard<std::mutex> lock(processing_mutex);
-                //     if (processing_queue.size() > PROCESSING_BUFFER_SIZE * 0.7) {
-                //         LOG_INFO("Display thread fast path: backlog, accelerate consumption");
-                //     }
-                // }
                 auto t_imshow_end = std::chrono::steady_clock::now();
                 g_disp_imshow_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_imshow_end - t_imshow_start).count();
 
@@ -1254,7 +1172,7 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                 total_display_time_ms += display_time;
 
                 auto t_waitkey_start = std::chrono::steady_clock::now();
-                int key = cv::waitKey(1); // non-blocking minimal wait
+                int key = cv::waitKey(1);
                 auto t_waitkey_end = std::chrono::steady_clock::now();
                 g_disp_waitkey_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_waitkey_end - t_waitkey_start).count();
                 g_disp_frames++;
@@ -1269,14 +1187,12 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                     }
                 }
                 
-                // 🔥 Async video saving - push ORIGINAL resolution to queue (not downscaled)
+                // Async video saving: push original resolution to queue (not downscaled)
                 if (FLAGS_enable_video_output) {
                     auto t_write_start = std::chrono::steady_clock::now();
                     
-                    // Wait for space in video save queue (with timeout to avoid deadlock)
                     std::unique_lock<std::mutex> save_lock(video_save_mutex);
                     if (video_save_queue.size() >= VIDEO_SAVE_BUFFER_SIZE) {
-                        // Queue full, wait briefly or skip (to avoid blocking display)
                         auto timeout = std::chrono::milliseconds(5);
                         video_save_not_full.wait_for(save_lock, timeout, [&] {
                             return video_save_queue.size() < VIDEO_SAVE_BUFFER_SIZE || should_exit;
@@ -1285,14 +1201,13 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                     
                     if (video_save_queue.size() < VIDEO_SAVE_BUFFER_SIZE) {
                         VideoSaveItem save_item;
-                        save_item.vis_frame = item.vis_frame.clone();  // 🔥 Save ORIGINAL resolution, not downscaled
+                        save_item.vis_frame = item.vis_frame.clone();
                         save_item.frame_number = item.frame_number;
                         save_item.timestamp = std::chrono::steady_clock::now();
                         video_save_queue.push(std::move(save_item));
                         save_lock.unlock();
                         video_save_not_empty.notify_one();
                     } else {
-                        // Queue still full after timeout - skip this frame to avoid blocking
                         LOG_WARNING("Video save queue full, skipping frame " << item.frame_number);
                     }
                     
@@ -1300,7 +1215,7 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                     g_disp_write_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_write_end - t_write_start).count();
                 }
             } else {
-                // 🔥 When display disabled, also use async video saving (ORIGINAL resolution)
+                // When display disabled, also use async video saving (original resolution)
                 if (FLAGS_enable_video_output) {
                     std::unique_lock<std::mutex> save_lock(video_save_mutex);
                     if (video_save_queue.size() >= VIDEO_SAVE_BUFFER_SIZE) {
@@ -1312,7 +1227,7 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                     
                     if (video_save_queue.size() < VIDEO_SAVE_BUFFER_SIZE) {
                         VideoSaveItem save_item;
-                        save_item.vis_frame = item.vis_frame.clone();  // 🔥 Save ORIGINAL resolution
+                        save_item.vis_frame = item.vis_frame.clone();
                         save_item.frame_number = item.frame_number;
                         save_item.timestamp = std::chrono::steady_clock::now();
                         video_save_queue.push(std::move(save_item));
@@ -1320,8 +1235,6 @@ void MultiThreadTrackingApp::resultDisplayThread() {
                         video_save_not_empty.notify_one();
                     }
                 }
-                
-                // No waitKey to avoid GUI blocking; display time is minimal here
                 auto display_end_time = std::chrono::steady_clock::now();
                 auto display_time = std::chrono::duration_cast<std::chrono::milliseconds>(
                     display_end_time - frame_display_start_time).count();
@@ -1330,7 +1243,6 @@ void MultiThreadTrackingApp::resultDisplayThread() {
         }
     }
     
-    // 🔥 Notify video save thread that display is done
     display_finished = true;
     video_save_not_empty.notify_all();
     
@@ -1340,7 +1252,7 @@ void MultiThreadTrackingApp::resultDisplayThread() {
     }
 }
 
-// 🔥 Async video save thread - writes frames to disk without blocking display
+// Async video save thread: writes frames to disk without blocking display
 void MultiThreadTrackingApp::asyncVideoSaveThread() {
     LOG_INFO("Async video save thread started");
     
@@ -1391,7 +1303,6 @@ void MultiThreadTrackingApp::asyncVideoSaveThread() {
             
             saved_frame_count++;
             
-            // Log progress every 100 frames
             if (saved_frame_count % 100 == 0) {
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - save_start_time).count();

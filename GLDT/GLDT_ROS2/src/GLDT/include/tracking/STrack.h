@@ -32,6 +32,7 @@ public:
     int start_frame;
     TrackState state;
     int lost_frames_count;  // lost frame counter
+    int miss_count_in_grace;  // miss count in grace period (before真正Lost)
     
     // Additional attributes
     float quality_score;

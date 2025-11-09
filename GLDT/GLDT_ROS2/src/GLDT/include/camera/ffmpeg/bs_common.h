@@ -3,10 +3,10 @@
 #include <vector>
 #include <chrono>
 
-// 获取当前系统启动以来的毫秒数
+// Get current time in milliseconds since system startup
 static int64_t getCurTime()
 {
-    // tv_sec (s) tv_nsec (ns-纳秒)
+    // tv_sec (s) tv_nsec (ns-nanoseconds)
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec * 1000 + now.tv_nsec / 1000000);

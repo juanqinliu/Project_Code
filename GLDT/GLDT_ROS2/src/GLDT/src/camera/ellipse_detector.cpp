@@ -1348,17 +1348,17 @@ EllipseDetector::~EllipseDetector(void)
 }
 
 void EllipseDetector::SetParameters(Size  szPreProcessingGaussKernel,
-    double  dPreProcessingGaussSigma, // 高斯模糊,去噪声
-    float   fThPosition, // 位置约束,阈值,低于阈值不要
-    float   fMaxCenterDistance, // 中心点约束   
-    int     iMinEdgeLength, // 最小弧度常识,一般 8-16, 小于的弧不要
-    float   fMinOrientedRectSide, // 筛选弧参数,最小外接矩形,短边长度
-    float   fDistanceToEllipseContour, // fitting得分d, 一般几个像素
-    float   fMinScore, // 0.5 - 0.7, 最终椭圆得分阈值
-    float   fMinReliability, // 弧长与椭圆周长比值阈值
-    int     iNs, // 中心性约数, 2个弧中心与椭圆中心距离 一般22 
-    double  dPercentNe, // 边缘检测阈值, 越大保留的弧数量越多 0.9 - 0.99
-    float   fT_CNC, // 判读集合CNC, 一般不会调
+    double  dPreProcessingGaussSigma, // Gaussian blur, remove noise
+    float   fThPosition, // Position constraint, threshold, below threshold not allowed
+    float   fMaxCenterDistance, // Center point constraint   
+    int     iMinEdgeLength, // Minimum arc length, usually 8-16, arcs less than this are not allowed
+    float   fMinOrientedRectSide, // Filter arc parameter, minimum circumscribed rectangle, short side length
+    float   fDistanceToEllipseContour, // fitting score d, usually a few pixels
+    float   fMinScore, // 0.5 - 0.7, final ellipse score threshold
+    float   fMinReliability, // Arc length to ellipse circumference ratio threshold
+    int     iNs, // Center constraint, 2 arc centers and ellipse center distance usually 22 
+    double  dPercentNe, // Edge detection threshold, the larger the retained arc quantity越多 0.9 - 0.99
+    float   fT_CNC, // Decide set CNC, usually not adjusted
     float   fT_TCN_L,
     float   fT_TCN_P,
     float   fThre_r

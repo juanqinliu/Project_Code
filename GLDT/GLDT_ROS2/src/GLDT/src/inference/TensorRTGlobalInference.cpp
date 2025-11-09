@@ -96,27 +96,27 @@ TensorRTGlobalInference::TensorRTGlobalInference(const std::string& engine_path)
     }
     preprocess_mode_ = getGlobalPreprocessMode();
     LOG_INFO("Global inference engine loaded: " << engine_path << ", preprocess mode: " << preprocess_mode_);
-    // 设置后处理模式（只通过gflags）
+    // Set postprocess mode (only through gflags)
     postprocess_mode_ = getGlobalPostprocessMode();
     LOG_INFO("Global postprocess mode: " << (postprocess_mode_ == PostprocessMode::CPU ? "CPU" : "GPU"));
 }
 
 bool TensorRTGlobalInference::initializeBindings() {
-    // Use legacy TensorRT API for compatibility
-    int nb_tensors = engine_->getNbBindings();
+    // Use modern TensorRT API
+    int nb_tensors = engine_->getNbIOTensors();
     bindings_.resize(nb_tensors, nullptr);
     
     // Remove detailed binding information log
     
     // Find input and output tensor indices
     for (int i = 0; i < nb_tensors; ++i) {
-        std::string name = engine_->getBindingName(i);
-        bool is_input = engine_->bindingIsInput(i);
+        std::string name = engine_->getIOTensorName(i);
+        nvinfer1::TensorIOMode io_mode = engine_->getTensorIOMode(name.c_str());
         
-        if (is_input) {
+        if (io_mode == nvinfer1::TensorIOMode::kINPUT) {
             if (name == kCurrentFrameTensorName) current_frame_index_ = i;
             if (name == kPreviousFrameTensorName) previous_frame_index_ = i;
-        } else {
+        } else if (io_mode == nvinfer1::TensorIOMode::kOUTPUT) {
             if (name == kGlobalOutputTensorName) detection_output_index_ = i;
         }
     }
@@ -132,7 +132,8 @@ bool TensorRTGlobalInference::initializeBindings() {
     // Check if there are dynamic shapes
     bool has_dynamic_shapes = false;
     for (int i = 0; i < nb_tensors; ++i) {
-        nvinfer1::Dims dims = engine_->getBindingDimensions(i);
+        std::string name = engine_->getIOTensorName(i);
+        nvinfer1::Dims dims = engine_->getTensorShape(name.c_str());
         for (int j = 0; j < dims.nbDims; ++j) {
             if (dims.d[j] == -1) {
                 has_dynamic_shapes = true;
@@ -143,7 +144,7 @@ bool TensorRTGlobalInference::initializeBindings() {
     }
     
     // Get input and output dimensions
-    auto input_dims = engine_->getBindingDimensions(current_frame_index_);
+    auto input_dims = engine_->getTensorShape(kCurrentFrameTensorName);
     input_dims_ = cv::Size(kInputW, kInputH);
     
     // For dynamic shapes, use predefined dimensions
@@ -159,7 +160,7 @@ bool TensorRTGlobalInference::initializeBindings() {
     }
     
     // Get output dimensions and format
-    auto output_dims = engine_->getBindingDimensions(detection_output_index_);
+    auto output_dims = engine_->getTensorShape(kGlobalOutputTensorName);
     
     // Remove output dimension log
     
@@ -196,10 +197,10 @@ bool TensorRTGlobalInference::initializeBindings() {
                 // Remove default output format setting log
             }
         } else {
-            // Dimension不足，使用默认设置
+            // Dimension insufficient, use default settings
             num_boxes_ = 25200;
             output_size_ = num_boxes_ * kBoxInfoSize;
-            // Remove dimension不足日志
+            // Remove dimension insufficient log
         }
     } else {
         // For static shapes, use engine defined dimensions
@@ -231,9 +232,10 @@ bool TensorRTGlobalInference::initializeBindings() {
     
     // Allocate memory for all bindings
     for (int i = 0; i < nb_tensors; ++i) {
-        std::string name = engine_->getBindingName(i);
-        bool isInput = engine_->bindingIsInput(i);
-        nvinfer1::Dims dims = engine_->getBindingDimensions(i);
+        std::string name = engine_->getIOTensorName(i);
+        nvinfer1::TensorIOMode io_mode = engine_->getTensorIOMode(name.c_str());
+        bool isInput = (io_mode == nvinfer1::TensorIOMode::kINPUT);
+        nvinfer1::Dims dims = engine_->getTensorShape(name.c_str());
         
         // Determine allocation size
         size_t elem_size = sizeof(float);  // Assume all tensors are float type
@@ -247,7 +249,7 @@ bool TensorRTGlobalInference::initializeBindings() {
                 size = input_size_;
             } else {
                     // Other inputs use default size
-                    size = 1000000;  // 1M浮点数
+                    size = 1000000;  // 1M float numbers
                 }
             } else {
                 // For standard output, use calculated size
@@ -384,10 +386,12 @@ std::vector<Detection> TensorRTGlobalInference::detectWithPreviousFrame(const cv
     
     // Check if engine uses dynamic shapes
     bool has_dynamic_shapes = false;
-    int nb_tensors = engine_->getNbBindings();
+    int nb_tensors = engine_->getNbIOTensors();
     for (int i = 0; i < nb_tensors; ++i) {
-        if (engine_->bindingIsInput(i)) {
-            nvinfer1::Dims dims = engine_->getBindingDimensions(i);
+        std::string name = engine_->getIOTensorName(i);
+        nvinfer1::TensorIOMode io_mode = engine_->getTensorIOMode(name.c_str());
+        if (io_mode == nvinfer1::TensorIOMode::kINPUT) {
+            nvinfer1::Dims dims = engine_->getTensorShape(name.c_str());
             for (int j = 0; j < dims.nbDims; ++j) {
                 if (dims.d[j] == -1) {
                     has_dynamic_shapes = true;
@@ -402,8 +406,10 @@ std::vector<Detection> TensorRTGlobalInference::detectWithPreviousFrame(const cv
     if (has_dynamic_shapes) {
         // Set dimensions for all inputs
         for (int i = 0; i < nb_tensors; ++i) {
-            if (engine_->bindingIsInput(i)) {
-                nvinfer1::Dims dims = engine_->getBindingDimensions(i);
+            std::string name = engine_->getIOTensorName(i);
+            nvinfer1::TensorIOMode io_mode = engine_->getTensorIOMode(name.c_str());
+            if (io_mode == nvinfer1::TensorIOMode::kINPUT) {
+                nvinfer1::Dims dims = engine_->getTensorShape(name.c_str());
                 bool has_dynamic_dim = false;
                 
                 // Check if there are dynamic dimensions
@@ -432,8 +438,8 @@ std::vector<Detection> TensorRTGlobalInference::detectWithPreviousFrame(const cv
                     }
                     
                     // Apply dimension settings
-                    if (!context_->setBindingDimensions(i, dims)) {
-                        LOG_ERROR("Failed to set dimensions for binding " << i << " (" << engine_->getBindingName(i) << ")");
+                    if (!context_->setInputShape(name.c_str(), dims)) {
+                        LOG_ERROR("Failed to set dimensions for binding " << i << " (" << name << ")");
                         return {};
                     }
                 }
@@ -448,9 +454,11 @@ std::vector<Detection> TensorRTGlobalInference::detectWithPreviousFrame(const cv
 
         // Update memory size for all output bindings
         for (int i = 0; i < nb_tensors; ++i) {
-            if (!engine_->bindingIsInput(i)) {
+            std::string name = engine_->getIOTensorName(i);
+            nvinfer1::TensorIOMode io_mode = engine_->getTensorIOMode(name.c_str());
+            if (io_mode == nvinfer1::TensorIOMode::kOUTPUT) {
                 // This is an output binding, get updated dimensions
-                nvinfer1::Dims dims = context_->getBindingDimensions(i);
+                nvinfer1::Dims dims = context_->getTensorShape(name.c_str());
                 size_t new_size = 1;
                 for (int j = 0; j < dims.nbDims; ++j) {
                     if (dims.d[j] > 0) {
@@ -550,9 +558,9 @@ std::vector<Detection> TensorRTGlobalInference::detectWithPreviousFrame(const cv
     }
     
     // Check if bindings are valid
-    for (int i = 0; i < engine_->getNbBindings(); ++i) {
+    for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
         if (bindings_[i] == nullptr) {
-            std::string name = engine_->getBindingName(i);
+            std::string name = engine_->getIOTensorName(i);
             LOG_ERROR("Error: binding " << i << " (" << name << ") is empty");
             return {};
         }
@@ -1085,7 +1093,7 @@ std::vector<Detection> TensorRTGlobalInference::parseYOLOOutput(float* output, i
     }
     
     // Get correct dimensions of output from context
-    nvinfer1::Dims output_dims = context_->getBindingDimensions(detection_output_index_);
+    nvinfer1::Dims output_dims = context_->getTensorShape(kGlobalOutputTensorName);
     
     // Remove parsing output data log
     

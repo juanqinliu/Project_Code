@@ -13,19 +13,19 @@ from launch.conditions import IfCondition
 from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
-    # 获取包路径
+    # Get package path
     pkg_share = get_package_share_directory('gldt')
     
-    # 声明启动参数
+    # Declare launch arguments
     global_model_arg = DeclareLaunchArgument(
         'global_model',
-        default_value='weigjhts/global.engine',
+        default_value='Weigjhts/global_int8.engine',
         description='Path to global model engine file'
     )
     
     local_model_arg = DeclareLaunchArgument(
         'local_model', 
-        default_value='weights/local.engine',
+        default_value='Weights/local_fp16.engine',
         description='Path to local model engine file'
     )
     
@@ -59,7 +59,7 @@ def generate_launch_description():
         description='Enable ROS2 publishing'
     )
     
-    # 创建GLDT节点
+    # Create GLDT node
     gldt_node = Node(
         package='gldt',
         executable='gldt_node',
@@ -83,7 +83,7 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('enable_ros'))
     )
     
-    # 创建非ROS模式的可执行文件启动
+    # Create non-ROS mode executable file launch
     gldt_process = ExecuteProcess(
         cmd=[
             'bash', '-c',
@@ -101,7 +101,7 @@ def generate_launch_description():
         condition=IfCondition(PythonExpression([LaunchConfiguration('enable_ros'), ' == "false"']))
     )
     
-    # 显示启动信息
+    # Display launch information
     launch_info = LogInfo(
         msg=[
             'Starting GLDT Tracking System with parameters:\n',

@@ -184,6 +184,23 @@ private:
     };
     std::unique_ptr<BatchMemoryContext> batch_ctx_;
     
+    // 🔥 多Stream并行前处理上下文
+    struct MultiStreamPreprocessContext {
+        std::vector<cudaStream_t> streams;           // 多个CUDA stream用于并行
+        std::vector<void*> temp_buffers;             // 每个stream的临时缓冲区
+        std::vector<size_t> buffer_capacities;       // 每个缓冲区的容量
+        int num_streams = 0;
+        std::mutex mutex;
+        
+        ~MultiStreamPreprocessContext() {
+            cleanup();
+        }
+        
+        void cleanup();
+        bool ensure_streams(int required_streams, size_t buffer_size_per_stream);
+    };
+    std::unique_ptr<MultiStreamPreprocessContext> multi_stream_ctx_;
+    
     // 模型常量
     static constexpr int kInputW = 640;
     static constexpr int kInputH = 640;

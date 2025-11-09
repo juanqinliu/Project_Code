@@ -8,7 +8,6 @@ A ROS2-integrated version of the GLDT (Global-Local Detection and Tracking) syst
 
 ```bash
 cd /home/developer/workspace/GLDT_ROS2
-source /opt/ros/foxy/setup.bash
 colcon build
 source install/setup.bash
 ```

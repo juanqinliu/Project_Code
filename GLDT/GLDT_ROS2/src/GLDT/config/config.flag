@@ -25,10 +25,10 @@
 --use_original_bytetrack=false
 
 ## Enable GMM memory recovery
---enable_gmm_memory_recovery=true
+--use_pmr_module=true
 
 # Extract appearance during detection: store thumbnails (recommended off to save cost)
---enable_appearance=true
+--enable_appearance=false
 
 
 # ===========================
@@ -55,7 +55,7 @@
 # Preprocess mode: 0=CPU, 1=CPU+GPU hybrid, 2=GPU
 --local_preprocess_mode=2
 # Postprocess mode: 0=CPU, 1=GPU
---local_postprocess_mode=0
+--local_postprocess_mode=1
 # Local phase duration: consecutive frames using local detection
 --local_duration=120
 
@@ -168,4 +168,8 @@
 --log_binding_info=false
 # Log detection boxes details
 --log_detection_boxes=false
+# Log detailed batch inference timing (for debugging parallel inference)
+--log_batch_timing=true
+# Log detailed tracking process (matching stages, costs, track states)
+--log_tracking_details=false
 

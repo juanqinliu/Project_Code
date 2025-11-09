@@ -100,6 +100,19 @@ void ROIManager::updateROIPositions(std::vector<std::unique_ptr<STrack>>& tracks
                 cv::Point2f predicted_center = track->getPredictedCenter();
                 cv::Size2f track_size(track->tlwh.width, track->tlwh.height);
                 
+                // 🔥 Grace Period expansion: if track is in Grace Period (using prediction), expand uncertainty range
+                if (track->miss_count_in_grace > 0) {
+                    // Expand uncertainty based on miss count linearly
+                    // miss 1次：+20%，miss 2次：+40%，miss 3次：+60%
+                    float uncertainty_factor = 1.0f + (track->miss_count_in_grace * 0.2f);
+                    track_size.width *= uncertainty_factor;
+                    track_size.height *= uncertainty_factor;
+                    
+                    // LOG_INFO("  🔥 Target ID-" << track->displayId() << " in Grace Period (miss: " 
+                    //           << track->miss_count_in_grace << "), expanding size by " 
+                    //           << (uncertainty_factor * 100 - 100) << "%");
+                }
+                
                 track_centers.push_back(predicted_center);
                 track_info.emplace_back(predicted_center, track_size);
                 active_ids.insert(track->displayId());
@@ -123,9 +136,9 @@ void ROIManager::updateROIPositions(std::vector<std::unique_ptr<STrack>>& tracks
                 }
             }
             
-            // Check target number, if more than 1 target,可能需要分割而不是更新
+            // Check target number, if more than 1 target, may need to split instead of update
             if (track_centers.size() > 1) {
-                // LOG_INFO("  ⚠️ ROI-" << roi_id << " contains " << track_centers.size() << " targets,可能需要分割");
+                // LOG_INFO("  ⚠️ ROI-" << roi_id << " contains " << track_centers.size() << " targets, may need to split");
                 // Calculate distance between targets
                 float max_distance = 0.0f;
                 for (size_t i = 0; i < track_centers.size(); ++i) {
@@ -383,7 +396,7 @@ void ROIManager::mergeROIs(int roi_id1, int roi_id2, int frame_width, int frame_
     roi1->no_detection_count = std::min(roi1->no_detection_count, roi2->no_detection_count);
     roi1->no_tracking_count = std::min(roi1->no_tracking_count, roi2->no_tracking_count);
     
-    // 删除ROI2并回收ID
+
     rois_.erase(roi_id2);
     recycleROIId(roi_id2);
 }
@@ -487,7 +500,7 @@ int ROIManager::splitOversizedROIs(std::vector<std::unique_ptr<STrack>>& tracks,
         }
     }
     
-    // LOG_INFO("=== ROI分割检查结束，分割了 " << split_count << " 个ROI ===");
+
     return split_count;
 }
 
@@ -743,7 +756,7 @@ std::unordered_map<std::string, int> ROIManager::dynamicROIManagement(
 std::unordered_map<std::string, int> ROIManager::localPhaseROIManagement(
     std::vector<std::unique_ptr<STrack>>& tracks, 
     int frame_width, int frame_height, int frame_id) {
-    // 🔥 局部阶段：执行相同的ROI管理
+    // 🔥 Local phase: perform the same ROI management
     return performROIManagement(tracks, frame_width, frame_height, frame_id);
 }
 

@@ -11,6 +11,7 @@
 #include <opencv2/video/tracking.hpp> 
 #include <limits>
 #include <opencv2/ml.hpp>
+#include <unordered_set>
 #include "common/Flags.h"
 #include "tracking/Hungarian.h"
 
@@ -307,6 +308,32 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
     
     multiPredict(strack_pool);
     
+    // ✅ Remove invalid tracks after prediction
+    tracked_stracks_.erase(
+        std::remove_if(tracked_stracks_.begin(), tracked_stracks_.end(),
+            [](const std::unique_ptr<STrack>& track) {
+                return track->state == STrack::Removed;
+            }),
+        tracked_stracks_.end()
+    );
+    
+    lost_stracks_.erase(
+        std::remove_if(lost_stracks_.begin(), lost_stracks_.end(),
+            [](const std::unique_ptr<STrack>& track) {
+                return track->state == STrack::Removed;
+            }),
+        lost_stracks_.end()
+    );
+    
+    // ✅ Rebuild strack_pool after removing invalid tracks
+    strack_pool.clear();
+    for (auto& track : tracked_stracks_) {
+        strack_pool.push_back(track.get());
+    }
+    for (auto& track : lost_stracks_) {
+        strack_pool.push_back(track.get());
+    }
+    
     // 4. First stage: main matching - high confidence detection with predicted tracks
     // Check if in global mode
     bool is_global_mode = false;
@@ -378,10 +405,14 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
             auto* det = dets_high_ptr[det_idx];
             float match_cost = cost_matrix.at<float>(track_idx, det_idx);
             
-                LOG_INFO("First stage matching: track ID-" << track->displayId() 
-                          << " matches detection (confidence: " << det->score 
-                          << " match cost: " << match_cost << " threshold: " << primary_match_threshold << ")");
+            if (FLAGS_log_tracking_details) {
+                LOG_INFO("🎯 [Primary Match] Track ID-" << track->displayId() 
+                          << " ← Detection (conf: " << det->score 
+                          << " | cost: " << match_cost << " | thresh: " << primary_match_threshold << ")");
+            }
 
+            bool match_accepted = false;
+            
             if (track->state == STrack::Tracked) {
                 track->update(det->tlwh, det->score, frame_id_);
                 track->updateConfirmationStatus();
@@ -392,28 +423,77 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
                         break;
                     }
                 }
-            } else {
-                // Reactivate lost track
-                track->update(det->tlwh, det->score, frame_id_);
-                track->state = STrack::Tracked;
-                track->updateConfirmationStatus();
+                match_accepted = true;
                 
-                for (auto it = lost_stracks_.begin(); it != lost_stracks_.end(); ++it) {
-                    if (it->get() == track) {
-                        refind_stracks.push_back(std::make_unique<STrack>(*track));
+            } else if (track->state == STrack::Lost) {
+                // 🔥 Check conflict before reactivating lost track in primary match
+                bool has_conflict = false;
+                int conflicting_track_id = -1;
+                
+                for (const auto& active_track : tracked_stracks_) {
+                    if (active_track->state != STrack::Tracked || active_track.get() == track) {
+                        continue;
+                    }
+                    
+                    float iou = calculateIoU(active_track->tlwh, det->tlwh);
+                    float center_dist = cv::norm(active_track->center() - det->center());
+                    float avg_size = (active_track->tlwh.width + active_track->tlwh.height + 
+                                     det->tlwh.width + det->tlwh.height) / 4.0f;
+                    
+                    // Strict threshold for primary match
+                    float iou_thresh = 0.3f;
+                    float dist_thresh = std::max(35.0f, avg_size * 1.3f);
+                    
+                    if (iou > iou_thresh || center_dist < dist_thresh) {
+                        has_conflict = true;
+                        conflicting_track_id = active_track->displayId();
+                        if (FLAGS_log_tracking_details) {
+                            LOG_INFO("🚫 [Primary Match - Lost Track Recovery Rejected] Track ID-" << track->displayId() 
+                                      << " conflicts with active track ID-" << conflicting_track_id 
+                                      << " | IoU: " << iou << " (thresh: " << iou_thresh << ")"
+                                      << " | Center dist: " << center_dist << " (thresh: " << dist_thresh << ")");
+                        }
+                        break;
+                    }
+                }
+                
+                // Only recover if no conflict
+                if (!has_conflict) {
+                    if (FLAGS_log_tracking_details) {
+                        LOG_INFO("♻️  [Primary Match - Lost Track Recovered] Track ID-" << track->displayId() 
+                                  << " | Det conf: " << det->score << " | Lost for: " 
+                                  << (frame_id_ - track->frame_id) << " frames");
+                    }
+                    track->update(det->tlwh, det->score, frame_id_);
+                    track->state = STrack::Tracked;
+                    track->updateConfirmationStatus();
+                    
+                    for (auto it = lost_stracks_.begin(); it != lost_stracks_.end(); ++it) {
+                        if (it->get() == track) {
+                            refind_stracks.push_back(std::make_unique<STrack>(*track));
+                            break;
+                        }
+                    }
+                    match_accepted = true;
+                } else {
+                    // Recovery rejected, detection remains unmatched
+                    match_accepted = false;
+                }
+            }
+            
+            // Only mark detection as used if match was accepted
+            if (match_accepted) {
+                for (auto it = dets_high.begin(); it != dets_high.end(); ++it) {
+                    if (it->get() == det) {
+                        dets_high.erase(it);
                         break;
                     }
                 }
             }
-            
-            // Mark used detection as processed
-            for (auto it = dets_high.begin(); it != dets_high.end(); ++it) {
-                if (it->get() == det) {
-                    dets_high.erase(it);
-                    break;
-                }
-            }
         }
+        
+        // 🔥 Immediately check for duplicates after primary matching
+        removeDuplicateWithinTracked(tracked_stracks_);
     } else {
         // Matrix is empty, all tracks and detections are not matched
             u_track.resize(strack_pool.size());
@@ -512,9 +592,6 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
             mean_val = mean_scalar[0];
             std_val = std_scalar[0];
             
-            // LOG_INFO("救援匹配代价矩阵统计:");
-            // LOG_INFO("  最小值: " << min_val << " 最大值: " << max_val);
-            // LOG_INFO("  平均值: " << mean_val << " 标准差: " << std_val);
         }
         
         if (!rescue_cost_matrix.empty() && rescue_cost_matrix.rows > 0 && rescue_cost_matrix.cols > 0) {
@@ -538,11 +615,52 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
             std::vector<int> u_r_track = std::get<1>(result);
             std::vector<int> u_r_detection = std::get<2>(result);
             
-            // Process rescue matching results
+            // 🔥 Process rescue matching results with conflict checking
             for (auto& [track_idx, det_idx] : rescue_matches) {
                 auto* track = r_tracked_stracks[track_idx];
                 auto* det = dets_low_ptr[det_idx];
                 float match_cost = rescue_cost_matrix.at<float>(track_idx, det_idx);
+
+                // 🔥 Enhanced conflict detection for lost track recovery
+                bool detection_already_used = false;
+                int conflicting_track_id = -1;
+                
+                if (track->state == STrack::Lost) {
+                    for (const auto& active_track : tracked_stracks_) {
+                        if (active_track->state != STrack::Tracked) {
+                            continue;
+                        }
+                        
+                        float iou = calculateIoU(active_track->tlwh, det->tlwh);
+                        float center_dist = cv::norm(active_track->center() - det->center());
+                        float avg_size = (active_track->tlwh.width + active_track->tlwh.height + 
+                                         det->tlwh.width + det->tlwh.height) / 4.0f;
+                        
+                        // Stricter threshold: reject if overlap with ANY active track (not just confirmed)
+                        // Use adaptive thresholds based on object size
+                        float iou_thresh = 0.25f;  // Lower threshold to catch more conflicts
+                        float dist_thresh = std::max(30.0f, avg_size * 1.5f);  // Adaptive distance
+                        
+                        if (iou > iou_thresh || center_dist < dist_thresh) {
+                            detection_already_used = true;
+                            conflicting_track_id = active_track->displayId();
+                            if (FLAGS_log_tracking_details) {
+                                LOG_INFO("🚫 [Lost Track Recovery Rejected] Track ID-" << track->displayId() 
+                                          << " recovery rejected due to overlap with active track ID-" 
+                                          << conflicting_track_id << " | IoU: " << iou << " (thresh: " << iou_thresh << ")"
+                                          << " | Center dist: " << center_dist << " (thresh: " << dist_thresh << ")"
+                                          << " | Det conf: " << det->score 
+                                          << " | Lost for: " << (frame_id_ - track->frame_id) << " frames");
+                            }
+                            break;
+                        }
+                    }
+                }
+                
+                // Skip recovery if detection is already used
+                if (detection_already_used) {
+                    continue;
+                }
 
                 if (track->state == STrack::Tracked) {
                     track->update(det->tlwh, det->score, frame_id_);
@@ -555,6 +673,12 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
                         }
                     }
                 } else {
+                    // Lost track recovery
+                    if (FLAGS_log_tracking_details) {
+                        LOG_INFO("♻️  [Lost Track Recovered] Track ID-" << track->displayId() 
+                                  << " | Det conf: " << det->score << " | Lost for: " 
+                                  << (frame_id_ - track->frame_id) << " frames");
+                    }
                     track->update(det->tlwh, det->score, frame_id_);
                     track->state = STrack::Tracked;
                     track->updateConfirmationStatus();
@@ -575,7 +699,8 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
                 }
             }
             
-
+            // 🔥 Immediately check for duplicates after rescue matching
+            removeDuplicateWithinTracked(tracked_stracks_);
             
             // Update unmatched track indices
             std::vector<int> new_u_track;
@@ -631,7 +756,7 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
     // LOG_INFO("Collected unmatched high confidence detections number: " << u_high_detection.size());
     
     // Perform GMM memory recovery (delete ROI dependency)
-    if (FLAGS_enable_gmm_memory_recovery && !u_high_detection_ptr.empty()) {
+    if (FLAGS_use_pmr_module && !u_high_detection_ptr.empty()) {
         // Generate current frame lost tracks for GMM memory recovery
         std::vector<std::unique_ptr<STrack>> current_frame_lost_stracks;
         std::set<int> processed_track_ids;  
@@ -663,10 +788,6 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
         }
     }
     
-    // 7. Fourth stage: unmatched unconfirmed tracks matching
-    // LOG_INFO("=== Fourth stage: unmatched unconfirmed tracks matching ===");
-    // LOG_INFO("Unconfirmed tracks number: " << unconfirmed.size());
-    // LOG_INFO("Remaining high confidence detections number: " << u_high_detection_ptr.size());
     
     if (!unconfirmed.empty() && !u_high_detection_ptr.empty()) {
         // Build cost matrix for unmatched unconfirmed tracks matching
@@ -698,6 +819,9 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
         
         // LOG_INFO("Fourth stage matching result: " << u_matches.size() << " matches");
         
+        // ⚡ Optimized: Use marking instead of immediate deletion (O(N) instead of O(N²))
+        std::unordered_set<STrack*> used_detections_in_stage4;
+        
         // Process unmatched unconfirmed tracks matching result
     for (auto& [track_idx, det_idx] : u_matches) {
         if (track_idx >= 0 && track_idx < static_cast<int>(unconfirmed.size()) && 
@@ -715,19 +839,24 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
                     break;
                 }
             }
-                
-            for (auto it = u_high_detection.begin(); it != u_high_detection.end(); ++it) {
-                if (it->get() == det) {
-                    u_high_detection.erase(it);
-                    u_high_detection_ptr.clear();
-                    for (auto& det : u_high_detection) {
-                        u_high_detection_ptr.push_back(det.get());
-                    }
-                    break;
-                }
+            
+            // Mark detection as used (will be removed later)
+            used_detections_in_stage4.insert(det);
             }
         }
-    }
+        
+        // Remove used detections in a single pass
+        std::vector<std::unique_ptr<STrack>> remaining_after_stage4;
+        remaining_after_stage4.reserve(u_high_detection.size());
+        for (auto& det : u_high_detection) {
+            if (used_detections_in_stage4.find(det.get()) == used_detections_in_stage4.end()) {
+                remaining_after_stage4.push_back(std::move(det));
+            }
+        }
+        u_high_detection = std::move(remaining_after_stage4);
+        
+        // ⚡ Removed redundant duplicate check - will be done at final stage
+        // removeDuplicateWithinTracked(tracked_stracks_);  // Optimization: Phase 1
         
         // Remove unmatched unconfirmed tracks
         for (int i : u_unconfirmed) {
@@ -741,31 +870,46 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
                 }
             }
         }
-        
-        // Collect unmatched high confidence detections
-        std::vector<std::unique_ptr<STrack>> remaining_high_dets;
-        for (int i : u_detection_final) {
-            if (i >= 0 && i < static_cast<int>(u_high_detection.size())) {
-                remaining_high_dets.push_back(std::move(u_high_detection[i]));
-            }
-        }
-        u_high_detection = std::move(remaining_high_dets);
+        // ⚡ Note: u_high_detection already cleaned up above using marking method
+        // No need for additional filtering based on u_detection_final
     }
     
-    // 8. Mark unmatched tracks as lost
+
+    const int GRACE_PERIOD = 3;  // Allow continuous 3 frames without detection to output prediction results
+    
     for (int i : u_track) {
-        if (i < static_cast<int>(strack_pool.size()) && strack_pool[i]->state == STrack::Tracked) {
-            auto* lost_track = strack_pool[i];
-            // 🔥 Check if the track has been processed in the memory recovery stage
-            if (processed_track_ids.find(lost_track->displayId()) == processed_track_ids.end()) {
-            lost_track->markLost();
-            lost_stracks.push_back(std::make_unique<STrack>(*lost_track));
-                // LOG_INFO("Mark track ID-" << lost_track->displayId() << " as lost state");
-            } else {
-                // 🔥 If the track has been processed in the memory recovery stage, mark it as lost
-                lost_track->markLost();
-                lost_stracks.push_back(std::make_unique<STrack>(*lost_track));
-                // LOG_INFO("Track ID-" << lost_track->displayId() << " has been processed in the memory recovery stage, mark it as lost state");
+        if (i >= 0 && i < static_cast<int>(strack_pool.size())) {
+            auto* track = strack_pool[i];
+            
+            // Only process Tracked state tracks (not already Lost/Removed)
+            if (track && track->state == STrack::Tracked) {
+                // Increase miss count
+                track->miss_count_in_grace++;
+                track->lost_frames_count++;  // Used for subsequent timeout judgment
+                
+                // Within Grace Period, use prediction results to continue output (keep Tracked state)
+                if (track->miss_count_in_grace <= GRACE_PERIOD) {
+                    // 🔥 Key: still output this track (using Kalman predicted position)
+                    activated_stracks.push_back(std::make_unique<STrack>(*track));
+                    
+                    if (FLAGS_log_tracking_details) {
+                        LOG_INFO("⏳ [Track in Grace Period] ID-" << track->displayId() 
+                                  << " | Miss: " << track->miss_count_in_grace << "/" << GRACE_PERIOD
+                                  << " | Using prediction: [" << track->tlwh.x << "," << track->tlwh.y << ","
+                                  << track->tlwh.width << "," << track->tlwh.height << "]");
+                    }
+                } else {
+                    // Exceed Grace Period, mark as Lost
+                    track->markLost();
+                    lost_stracks.push_back(std::make_unique<STrack>(*track));
+                    
+                    if (FLAGS_log_tracking_details) {
+                        LOG_INFO("🔻 [Track Lost] ID-" << track->displayId() 
+                                  << " | Frame: " << frame_id_
+                                  << " | Length: " << track->tracklet_len
+                                  << " | Miss count exceeded grace period: " << track->miss_count_in_grace);
+                    }
+                }
             }
         }
     }
@@ -781,16 +925,95 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
         unmatched_detections.push_back(std::move(det));
     }
     
-    // Directly initialize new tracks
-    for (auto& track : unmatched_detections) {
-        if (track->score >= 0.6f && !track->is_recovered) {
-            // LOG_INFO("Create new track: detection confidence " << track->score << " satisfies high confidence requirement");
-            track->activate(frame_id_);
-            activated_stracks.push_back(std::move(track));
-        } else if (track->score >= config_.new_track_thresh && track->score < 0.6f) {
-            // LOG_INFO("Skip medium confidence detection to create new track: confidence " << track->score << " does not satisfy high confidence requirement (≥0.6)");
-        } else {
-            // LOG_INFO("Discard low confidence detection: confidence " << track->score << " is below new track threshold " << config_.new_track_thresh);
+    // 🔥 Enhanced overlap checking: try to recover lost tracks instead of creating new ones
+    for (auto& det_track : unmatched_detections) {
+        if (det_track->score < 0.6f || det_track->is_recovered) {
+            continue;
+        }
+        
+        bool overlaps_with_existing = false;
+        STrack* best_matching_lost_track = nullptr;
+        float best_match_score = 0.0f;
+        
+        // Check overlap with active tracks (strict)
+        for (const auto& active_track : tracked_stracks_) {
+            float iou = calculateIoU(det_track->tlwh, active_track->tlwh);
+            float center_dist = cv::norm(det_track->center() - active_track->center());
+            float avg_size = (det_track->tlwh.width + det_track->tlwh.height + 
+                             active_track->tlwh.width + active_track->tlwh.height) / 4.0f;
+            
+            // Stricter threshold for active tracks
+            float dist_thresh = std::max(25.0f, avg_size * 1.2f);
+            
+            if (iou > 0.4f || center_dist < dist_thresh) {
+                overlaps_with_existing = true;
+                if (FLAGS_log_tracking_details) {
+                    LOG_INFO("🚫 [New Track Rejection] Detection overlaps with active track ID-" 
+                              << active_track->displayId() << " | IoU: " << iou 
+                              << " | Center dist: " << center_dist << " (thresh: " << dist_thresh << ")");
+                }
+                break;
+            }
+        }
+        
+        // Check if this detection matches a recently lost track better
+        if (!overlaps_with_existing) {
+            for (const auto& lost_track : lost_stracks_) {
+                // Only consider recently lost tracks (within 5 frames)
+                int frames_lost = frame_id_ - lost_track->frame_id;
+                if (frames_lost > 5) continue;
+                
+                float iou = calculateIoU(det_track->tlwh, lost_track->tlwh);
+                float center_dist = cv::norm(det_track->center() - lost_track->center());
+                float avg_size = (det_track->tlwh.width + det_track->tlwh.height + 
+                                 lost_track->tlwh.width + lost_track->tlwh.height) / 4.0f;
+                
+                // Adaptive threshold based on how long track has been lost
+                float iou_thresh = 0.2f + (frames_lost * 0.05f);  // Gradually relax threshold
+                float dist_thresh = std::max(40.0f, avg_size * (1.5f + frames_lost * 0.2f));
+                
+                // Calculate combined match score (higher is better)
+                float match_score = iou * 0.7f + (1.0f - center_dist / dist_thresh) * 0.3f;
+                
+                if (iou > iou_thresh || center_dist < dist_thresh) {
+                    if (match_score > best_match_score) {
+                        best_match_score = match_score;
+                        best_matching_lost_track = lost_track.get();
+                    }
+                }
+            }
+        }
+        
+        // Decision: recover lost track or create new track
+        if (!overlaps_with_existing) {
+            if (best_matching_lost_track != nullptr && best_match_score > 0.3f) {
+                // Recover the lost track instead of creating new one
+                if (FLAGS_log_tracking_details) {
+                    LOG_INFO("♻️  [Lost Track Recovered via New Detection] Track ID-" 
+                              << best_matching_lost_track->displayId() 
+                              << " | Det conf: " << det_track->score 
+                              << " | Match score: " << best_match_score
+                              << " | Lost for: " << (frame_id_ - best_matching_lost_track->frame_id) << " frames");
+                }
+                
+                // Update the lost track with new detection
+                best_matching_lost_track->update(det_track->tlwh, det_track->score, frame_id_);
+                best_matching_lost_track->state = STrack::Tracked;
+                best_matching_lost_track->updateConfirmationStatus();
+                
+                // Move from lost to refind
+                refind_stracks.push_back(std::make_unique<STrack>(*best_matching_lost_track));
+                
+            } else {
+                // Create new track
+                if (FLAGS_log_tracking_details) {
+                    LOG_INFO("✅ [New Track Created] Confidence: " << det_track->score 
+                              << " | Position: [" << det_track->tlwh.x << "," << det_track->tlwh.y << "]"
+                              << " | No matching lost track found");
+                }
+                det_track->activate(frame_id_);
+                activated_stracks.push_back(std::move(det_track));
+            }
         }
     }
     
@@ -869,8 +1092,24 @@ std::vector<std::unique_ptr<STrack>> TPTrack::update(
             }
         }
         
+        // ✅ Validate track coordinates before outputting
         if (should_keep) {
-            output_stracks.push_back(std::make_unique<STrack>(*track));
+            const auto& bbox = track->tlwh;
+            // Check for valid, non-zero coordinates
+            bool is_valid = std::isfinite(bbox.x) && std::isfinite(bbox.y) && 
+                           std::isfinite(bbox.width) && std::isfinite(bbox.height) &&
+                           bbox.width > 0.01f && bbox.height > 0.01f &&  // ✅ Reject zero or near-zero dimensions
+                           bbox.x > -5000.0f && bbox.x < 10000.0f &&
+                           bbox.y > -5000.0f && bbox.y < 10000.0f &&
+                           bbox.width < 5000.0f && bbox.height < 5000.0f &&
+                           !(bbox.x == 0.0f && bbox.y == 0.0f && bbox.width == 0.0f && bbox.height == 0.0f);  // ✅ Reject zero bbox
+            
+            if (is_valid) {
+                output_stracks.push_back(std::make_unique<STrack>(*track));
+            } else {
+                // Mark invalid track for removal
+                track->state = STrack::Removed;
+            }
         }
     }
     
@@ -958,6 +1197,7 @@ TPTrack::hungarianAssignment(const cv::Mat& cost_matrix, float thresh) {
 
     cv::Mat assignment_mat;
     float min_cost = tracking::Hungarian(cost_8u, assignment_mat);
+    (void)min_cost;  // Suppress unused variable warning
     
     // process the matching results
     for (int i = 0; i < rows; i++) {
@@ -1002,6 +1242,18 @@ TPTrack::linearAssignment(const cv::Mat& cost_matrix, float thresh) {
 void TPTrack::multiPredict(const std::vector<STrack*>& stracks) {
     for (auto* track : stracks) {
         track->predict();
+        
+        // ✅ Check if prediction resulted in invalid values
+        if (track->state == STrack::Removed) {
+            continue;  // Track marked as invalid during prediction
+        }
+        
+        // ✅ Double-check coordinate validity after prediction
+        const auto& bbox = track->tlwh;
+        if (!std::isfinite(bbox.x) || !std::isfinite(bbox.y) || 
+            !std::isfinite(bbox.width) || !std::isfinite(bbox.height)) {
+            track->state = STrack::Removed;
+        }
     }
 }
 
@@ -2322,35 +2574,106 @@ static float computeIoURect(const cv::Rect2f& a, const cv::Rect2f& b) {
 }
 static void removeDuplicateWithinTracked(std::vector<std::unique_ptr<STrack>>& tracked) {
     if (tracked.size() < 2) return;
+    
     // Mark indices to be removed
     std::vector<bool> remove_flag(tracked.size(), false);
+    std::vector<std::string> remove_reasons(tracked.size());
+    
     for (size_t i = 0; i < tracked.size(); ++i) {
         if (remove_flag[i]) continue;
+        
         for (size_t j = i + 1; j < tracked.size(); ++j) {
             if (remove_flag[j]) continue;
+            
             float iou = computeIoURect(tracked[i]->tlwh, tracked[j]->tlwh);
             float center_dist = cv::norm(tracked[i]->center() - tracked[j]->center());
             bool same_roi = (tracked[i]->roi_id > 0 && tracked[i]->roi_id == tracked[j]->roi_id);
-            if (iou > 0.85f || (same_roi && center_dist < 15.0f)) {
-                // Choose the retainer: first confirmed, then track length
+            
+            float avg_size = (tracked[i]->tlwh.width + tracked[i]->tlwh.height + 
+                             tracked[j]->tlwh.width + tracked[j]->tlwh.height) / 4.0f;
+            
+            // 🔥 Enhanced duplicate detection with adaptive thresholds
+            float iou_thresh = 0.5f;  // Lower threshold to catch more duplicates
+            float dist_thresh = std::max(20.0f, avg_size * 1.0f);  // Adaptive based on size
+            
+            // Stricter criteria for same ROI
+            if (same_roi) {
+                iou_thresh = 0.3f;
+                dist_thresh = std::max(15.0f, avg_size * 0.8f);
+            }
+            
+            bool is_duplicate = false;
+            std::string reason;
+            
+            if (iou > iou_thresh) {
+                is_duplicate = true;
+                reason = "high IoU: " + std::to_string(iou);
+            } else if (center_dist < dist_thresh) {
+                is_duplicate = true;
+                reason = "close center: " + std::to_string(center_dist) + "px";
+            }
+            
+            if (is_duplicate) {
+                // Priority: confirmed > longer tracklet > higher confidence > older track
                 auto length_i = tracked[i]->frame_id - tracked[i]->start_frame;
                 auto length_j = tracked[j]->frame_id - tracked[j]->start_frame;
-                bool keep_i = (tracked[i]->is_confirmed && !tracked[j]->is_confirmed) ||
-                              (tracked[i]->is_confirmed == tracked[j]->is_confirmed && length_i >= length_j);
+                
+                int priority_i = 0;
+                int priority_j = 0;
+                
+                // 1. Confirmed status (highest priority)
+                if (tracked[i]->is_confirmed) priority_i += 1000;
+                if (tracked[j]->is_confirmed) priority_j += 1000;
+                
+                // 2. Track length (second priority)
+                priority_i += length_i * 10;
+                priority_j += length_j * 10;
+                
+                // 3. Confidence score
+                priority_i += static_cast<int>(tracked[i]->score * 100);
+                priority_j += static_cast<int>(tracked[j]->score * 100);
+                
+                // 4. Age (older track ID preferred, assuming sequential IDs)
+                if (tracked[i]->track_id < tracked[j]->track_id) priority_i += 5;
+                else priority_j += 5;
+                
+                bool keep_i = (priority_i >= priority_j);
+                
                 if (keep_i) {
                     remove_flag[j] = true;
+                    remove_reasons[j] = "Duplicate with ID-" + std::to_string(tracked[i]->displayId()) + 
+                                       " (" + reason + ")";
+                    if (FLAGS_log_tracking_details) {
+                        LOG_INFO("🗑️  [Duplicate Removed] Track ID-" << tracked[j]->displayId() 
+                                  << " (len:" << length_j << ", conf:" << tracked[j]->is_confirmed << ")"
+                                  << " is duplicate of ID-" << tracked[i]->displayId()
+                                  << " (len:" << length_i << ", conf:" << tracked[i]->is_confirmed << ")"
+                                  << " | " << reason);
+                    }
                 } else {
                     remove_flag[i] = true;
-                    break;
+                    remove_reasons[i] = "Duplicate with ID-" + std::to_string(tracked[j]->displayId()) + 
+                                       " (" + reason + ")";
+                    if (FLAGS_log_tracking_details) {
+                        LOG_INFO("🗑️  [Duplicate Removed] Track ID-" << tracked[i]->displayId() 
+                                  << " (len:" << length_i << ", conf:" << tracked[i]->is_confirmed << ")"
+                                  << " is duplicate of ID-" << tracked[j]->displayId()
+                                  << " (len:" << length_j << ", conf:" << tracked[j]->is_confirmed << ")"
+                                  << " | " << reason);
+                    }
+                    break;  // i is removed, skip remaining j iterations
                 }
             }
         }
     }
-    // Filter
+    
+    // Filter out removed tracks
     std::vector<std::unique_ptr<STrack>> kept;
     kept.reserve(tracked.size());
     for (size_t i = 0; i < tracked.size(); ++i) {
-        if (!remove_flag[i]) kept.push_back(std::move(tracked[i]));
+        if (!remove_flag[i]) {
+            kept.push_back(std::move(tracked[i]));
+        }
     }
     tracked = std::move(kept);
 }

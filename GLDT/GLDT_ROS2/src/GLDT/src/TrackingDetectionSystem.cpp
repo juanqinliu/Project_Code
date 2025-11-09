@@ -52,14 +52,13 @@ TrackingDetectionSystem::TrackingDetectionSystem(const std::string& global_model
         Logger::setVerbose(config_.verbose_logging);
     }
     
-    // 🔥 Set detection mode using configuration flags
+    // Set detection mode using configuration flags
     detection_mode_ = FLAGS_detection_mode;
     if (detection_mode_ == 0) {
         LOG_INFO("⚠️ Detection mode: Global detection only (no local ROI detection)");
     } else {
         LOG_INFO("✅ Detection mode: Global + Local joint detection (default mode)");
     }
-    
     
     LOG_INFO("Initializing tracking detection system...");
     LOG_INFO("Global phase duration: " << config_.global_duration << " frames");
@@ -69,7 +68,6 @@ TrackingDetectionSystem::TrackingDetectionSystem(const std::string& global_model
     // Initialize ROI manager
     roi_manager_ = std::make_shared<ROIManager>(config);
     
-    // Initialize global and local trackers
     global_tracker_ = std::make_unique<TPTrack>(config, 30, roi_manager_);
     local_tracker_ = std::make_unique<TPTrack>(config, 30, roi_manager_);
     
@@ -81,16 +79,16 @@ TrackingDetectionSystem::TrackingDetectionSystem(const std::string& global_model
     bool use_original_bytetrack = FLAGS_use_original_bytetrack;
     tracker_->setUseOriginalByteTrack(use_original_bytetrack);
     if (use_original_bytetrack) {
-        LOG_INFO("⚠️ Using original ByteTrack algorithm (ROI constraints and memory recovery disabled)");
+        LOG_INFO("Using original ByteTrack algorithm (ROI constraints and memory recovery disabled)");
     } else {
-        LOG_INFO("✅ Using enhanced ByteTrack algorithm (ROI constraints and memory recovery enabled)");
+        LOG_INFO("Using enhanced ByteTrack algorithm");
     }
     
     // Initialize inference engines using factory pattern, global and local use different model files
     try {
         global_inference_ = createGlobalInferenceEngine(global_model_path);
         local_inference_ = createLocalInferenceEngine(local_model_path);
-        LOG_INFO("✅ Inference engine initialization successful:");
+        LOG_INFO("Inference engine initialization successful:");
         LOG_INFO("   - Global detection model: " << global_model_path);
         LOG_INFO("   - Local detection model: " << local_model_path);
     } catch (const std::exception& e) {
@@ -103,7 +101,6 @@ TrackingDetectionSystem::TrackingDetectionSystem(const std::string& global_model
     // 🔥 Initialize GPU monitoring
     initializeGPUMonitoring();
     
-    // 🔥 Initialize OpenMP parallel detection
     #ifdef _OPENMP
     num_threads_ = omp_get_max_threads();
     LOG_INFO("OpenMP available, max threads: " << num_threads_);
@@ -116,7 +113,6 @@ TrackingDetectionSystem::TrackingDetectionSystem(const std::string& global_model
     
 std::tuple<std::vector<Detection>, std::vector<std::unique_ptr<STrack>>> 
 TrackingDetectionSystem::process(const cv::Mat& frame) {
-    // 🔥 Start overall processing time measurement
     auto total_start = std::chrono::high_resolution_clock::now();
     
     frame_count_++;
@@ -124,7 +120,7 @@ TrackingDetectionSystem::process(const cv::Mat& frame) {
     LOG_INFO("frame_count_: " << frame_count_);
     
     // Set current frame ID for ROI manager
-    if (detection_mode_ != 0) { // Only update ROI manager state in non-global detection mode
+    if (detection_mode_ != 0) {
         roi_manager_->setCurrentFrameId(current_frame_id_);
     }
     
@@ -132,17 +128,23 @@ TrackingDetectionSystem::process(const cv::Mat& frame) {
     std::vector<std::unique_ptr<STrack>> updated_tracks;
     std::unordered_map<int, std::vector<Detection>> roi_detections;
     
-    // 🔥 Decide processing flow based on detection mode
+    // Decide processing flow based on detection mode
     if (detection_mode_ == 0 || isGlobalPhase()) {
-        // Global detection phase (or global detection only mode)
         detections = globalDetectionWithMotion(frame);
         
-        // 🔥 Start tracking time measurement
+        if (FLAGS_log_tracking_details) {
+            logTrackingInputState(detections, current_frame_id_);
+        }
+        
         auto tracking_start = std::chrono::high_resolution_clock::now();
         updated_tracks = tracker_->update(detections);
         auto tracking_end = std::chrono::high_resolution_clock::now();
         double tracking_time = std::chrono::duration<double, std::milli>(tracking_end - tracking_start).count();
         updateTrackingTime(tracking_time);
+        
+        if (FLAGS_log_tracking_details) {
+            logTrackingOutputState(updated_tracks, current_frame_id_);
+        }
         
         handleGlobalPhase(updated_tracks, detections, frame.cols, frame.rows);
         
@@ -150,28 +152,30 @@ TrackingDetectionSystem::process(const cv::Mat& frame) {
             finalizeGlobalPhaseEnhanced(frame.cols, frame.rows);
         }
     } else if (detection_mode_ == 1) {
-        // Local detection phase - first check if there are available ROIs
         const auto& rois = roi_manager_->getROIs();
         if (rois.empty()) {
-            // No ROI available, activate forced global phase, but don't update tracking twice in the same frame
-            LOG_WARNING("⚠️ Frame " << current_frame_id_ << ": No ROI in local phase, marking switch to global detection for next frame");
+            LOG_WARNING("Frame " << current_frame_id_ << ": No ROI in local phase, marking switch to global detection for next frame");
             activateForceGlobalPhase();
-            // Keep current frame result empty, handled uniformly by upper layer
         } else {
-            // Normal local detection
             auto [local_dets, roi_dets] = localDetection(frame);
             detections = local_dets;
             roi_detections = roi_dets;
             
-            // 🔥 Update ROI detection status (included in ROI adjustment time)
             roi_manager_->updateROIDetectionStatus(roi_detections);
             
-            // 🔥 Start tracking time measurement
+            if (FLAGS_log_tracking_details) {
+                logTrackingInputStateLocal(local_dets, roi_detections, current_frame_id_);
+            }
+            
             auto tracking_start = std::chrono::high_resolution_clock::now();
             updated_tracks = tracker_->update(local_dets, roi_detections);
             auto tracking_end = std::chrono::high_resolution_clock::now();
             double tracking_time = std::chrono::duration<double, std::milli>(tracking_end - tracking_start).count();
             updateTrackingTime(tracking_time);
+            
+            if (FLAGS_log_tracking_details) {
+                logTrackingOutputState(updated_tracks, current_frame_id_);
+            }
             
             // Check if local detection is empty and no active tracks, switch to global detection
             bool no_detections = detections.empty();
@@ -184,15 +188,11 @@ TrackingDetectionSystem::process(const cv::Mat& frame) {
             }
             
             if (no_detections && no_active_tracks) {
-                LOG_WARNING("⚠️ Frame " << current_frame_id_ << ": No targets in local detection and no active tracks, switching to global detection (next frame)");
-                // Only activate forced global flag, avoid calling update twice in current frame which would break ID continuity
+                LOG_WARNING("Frame " << current_frame_id_ << ": No targets in local detection and no active tracks, switching to global detection (next frame)");
                 activateForceGlobalPhase();
-                // Use updated_tracks result from local phase for current frame, don't call update again
             } else {
-                // Continue normal local phase processing
                 handleLocalPhase(updated_tracks, frame.cols, frame.rows);
                 
-                // Check if there are still ROIs after cleanup
                 if (roi_manager_->getROIs().empty()) {
                     activateForceGlobalPhase();
                 }
@@ -200,32 +200,27 @@ TrackingDetectionSystem::process(const cv::Mat& frame) {
         }
     }
     
-    // Check if forced global phase needs to end
     if (detection_mode_ == 1) {
         handleForceGlobalPhaseEnd();
     }
     
-    // 🔥 Start data processing time measurement
     auto data_processing_start = std::chrono::high_resolution_clock::now();
     
-    // Save current frame tracking results
     auto save_start = std::chrono::high_resolution_clock::now();
     saveFrameResults(updated_tracks);
     auto save_end = std::chrono::high_resolution_clock::now();
     double save_time = std::chrono::duration<double, std::milli>(save_end - save_start).count();
     
-    // 🔥 Print key tracking results (bypasses log_level, always visible)
     printKeyTrackingResults(frame_count_, detections, updated_tracks);
     
-    // Print tracking information (configurable verbose logging)
     auto print_start = std::chrono::high_resolution_clock::now();
-    if (config_.verbose_logging) {  // 🔥 Only print tracking info in verbose logging mode
+    if (config_.verbose_logging) {
         printTrackingInfo(updated_tracks);
     }
     auto print_end = std::chrono::high_resolution_clock::now();
     double print_time = std::chrono::duration<double, std::milli>(print_end - print_start).count();
     
-    // Update previous frame (prepare for next global detection)
+    // Update previous frame for next global detection
     auto clone_start = std::chrono::high_resolution_clock::now();
     prev_frame_ = frame.clone();
     auto clone_end = std::chrono::high_resolution_clock::now();
@@ -235,9 +230,9 @@ TrackingDetectionSystem::process(const cv::Mat& frame) {
     double data_processing_time = std::chrono::duration<double, std::milli>(data_processing_end - data_processing_start).count();
     updateDataProcessingTime(data_processing_time);
     
-    // 🔥 Optimization: Reduce data processing log print frequency
+    // Reduce data processing log print frequency
     if (frame_count_ % 100 == 0) {
-        LOG_INFO("📊 [Data Processing Time Details] Frame " << frame_count_ << ":");
+        LOG_INFO("[Data Processing Time Details] Frame " << frame_count_ << ":");
         LOG_INFO("  Save frame results time: " << std::fixed << std::setprecision(2) << save_time << "ms (" 
                  << std::fixed << std::setprecision(1) << (save_time/data_processing_time*100) << "%)");
         LOG_INFO("  Print tracking info time: " << std::fixed << std::setprecision(2) << print_time << "ms (" 
@@ -247,29 +242,24 @@ TrackingDetectionSystem::process(const cv::Mat& frame) {
         LOG_INFO("  Total data processing time: " << std::fixed << std::setprecision(2) << data_processing_time << "ms");
     }
     
-    // 🔥 End overall processing time measurement and statistics
     auto total_end = std::chrono::high_resolution_clock::now();
     double total_processing_time = std::chrono::duration<double, std::milli>(total_end - total_start).count();
     updateProcessingTime(total_processing_time);
     
-    // 🔥 Optimization: Reduce time statistics print frequency to lower I/O overhead
+    // Reduce time statistics print frequency to lower I/O overhead
     if (frame_count_ % 100 == 0) {
         printTimeStatistics();
     }
     
-    // frame_count_++;
-    
     return std::make_tuple(detections, std::move(updated_tracks));
 }
 
-// 🔥 Phase determination method implementation
 bool TrackingDetectionSystem::isGlobalPhase() const {
-    // 🔥 Modification: If set to global detection only mode, always return true
+    // If set to global detection only mode, always return true
     if (detection_mode_ == 0) {
         return true;
     }
     
-    // If forced into global phase, return true directly
     if (force_global_phase_) {
         return true;
     }
@@ -277,25 +267,25 @@ bool TrackingDetectionSystem::isGlobalPhase() const {
     // Normal cycle determination
     int cycle_length = config_.global_duration + config_.local_duration;  
     int position_in_cycle = frame_count_ % cycle_length;
-    bool is_global = position_in_cycle < config_.global_duration;  
+    // Use <= to ensure global_duration frames are processed as global
+    // e.g., if global_duration=30, frames 1-30 should be global phase
+    bool is_global = position_in_cycle <= config_.global_duration;  
     
     return is_global;
 }
 
-// Determine if global phase has ended
 bool TrackingDetectionSystem::isGlobalPhaseEnd() const {
     if (force_global_phase_) {
-        // Forced global phase: must complete config_.global_duration frames of detection
-        return (frame_count_ - force_global_start_frame_) >= config_.global_duration - 1;
+        return (frame_count_ - force_global_start_frame_) >= config_.global_duration;
     }
     
     // Normal cycle determination
     int cycle_length = config_.global_duration + config_.local_duration;
-    int next_position = (frame_count_ + 1) % cycle_length;
-    return next_position == config_.global_duration;
+    int position_in_cycle = frame_count_ % cycle_length;
+    // Global phase ends when current frame is the last global frame
+    // e.g., if global_duration=30, frame 30 is the last global frame
+    return position_in_cycle == config_.global_duration;
 }
-
-// 🔥 Detection method implementation
 std::vector<Detection> TrackingDetectionSystem::globalDetection(const cv::Mat& frame) {
     std::vector<Detection> detections;
     
@@ -334,7 +324,7 @@ std::vector<Detection> TrackingDetectionSystem::globalDetection(const cv::Mat& f
             double appearance_time = std::chrono::duration<double, std::milli>(appearance_end - appearance_start).count();
             
             if (frame_count_ % 50 == 0 && appearance_count > 0) {
-                LOG_INFO("📸 [Global Detection Appearance Extraction] Frame " << frame_count_ << ": " 
+                LOG_INFO("[Global Detection Appearance Extraction] Frame " << frame_count_ << ": " 
                          << appearance_count << " targets, time: " << std::fixed << std::setprecision(2) 
                          << appearance_time << "ms (avg " << std::fixed << std::setprecision(2) 
                          << (appearance_time/appearance_count) << "ms/target)");
@@ -344,7 +334,6 @@ std::vector<Detection> TrackingDetectionSystem::globalDetection(const cv::Mat& f
         auto end_time = std::chrono::steady_clock::now();
         double inference_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
         
-        // 🔥 Update inference time statistics
         updateInferenceTime(inference_time);
         
         if (config_.log_inference_details) {
@@ -353,7 +342,6 @@ std::vector<Detection> TrackingDetectionSystem::globalDetection(const cv::Mat& f
                      << "(threshold: " << config_.global_conf_thres << ")");
         }
         
-        // 🔥 New: Immediately output confidence statistics
         if (config_.log_inference_details) {
             if (detections.empty()) {
                 LOG_INFO("[ConfStats] No detection in current frame (global_conf_thres=" << std::fixed << std::setprecision(3)
@@ -404,7 +392,6 @@ TrackingDetectionSystem::localDetection(const cv::Mat& frame) {
         auto end_time = std::chrono::steady_clock::now();
         double inference_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
         
-        // 🔥 Update inference time statistics
         updateInferenceTime(inference_time);
         
         printDetectionSummary({}, inference_time);
@@ -414,29 +401,11 @@ TrackingDetectionSystem::localDetection(const cv::Mat& frame) {
     int roi_count = rois.size();
     std::tuple<std::vector<Detection>, std::unordered_map<int, std::vector<Detection>>> result;
     
-    // 🔥 Add detailed debug information
-    // LOG_INFO("🔍 [LocalDetection] Starting local detection, frame size: [" << frame.cols << " x " << frame.rows << "]");
-    // LOG_INFO("🔍 [LocalDetection] Current ROI count: " << roi_count);
-    
-    // 🔥 Optimized detection strategy selection - based on ROI count
+    // Optimized detection strategy selection based on ROI count
     std::string detection_mode;
     
-    // if (roi_count == 1) {
-    //     // Single ROI: Use single detection (most efficient)
-    //     detection_mode = "Single ROI Detection";
-    //     LOG_INFO("🔍 [LocalDetection] Using single ROI detection mode, ROI count: " << roi_count);
-    //     result = singleROIDetection(frame, false);
-    //     auto end_time = std::chrono::steady_clock::now();
-    //     double time_taken = std::chrono::duration<double>(end_time - start_time).count();
-    //     detection_stats_.single_times.push_back(time_taken);
-    //     if (detection_stats_.single_times.size() > DetectionStats::MAX_STATS) {
-    //         detection_stats_.single_times.pop_front();
-    //     }
-    // } else 
     if (roi_count >= 1 && roi_count <= 10) {
-        // 2-10 ROIs: Use batch detection
         detection_mode = "Batch Detection";
-        // LOG_INFO("🔍 [LocalDetection] Using batch detection mode, ROI count: " << roi_count);
         result = optimizedBatchDetection(frame, false);
         auto end_time = std::chrono::steady_clock::now();
         double time_taken = std::chrono::duration<double>(end_time - start_time).count();
@@ -445,10 +414,10 @@ TrackingDetectionSystem::localDetection(const cv::Mat& frame) {
             detection_stats_.batch_times.pop_front();
         }
     } else {
-        // More than 10 ROIs: Use chunked batch processing, without OpenMP parallelization
+        // More than 10 ROIs: Use chunked batch processing
         detection_mode = "Chunked Batch Detection";
         int batch_size = std::min(roi_count, detection_stats_.adaptive_batch_size);
-        LOG_INFO("🔍 [LocalDetection] Using chunked batch detection mode, ROI count: " << roi_count 
+        LOG_INFO("[LocalDetection] Using chunked batch detection mode, ROI count: " << roi_count 
                  << ", batch size: " << batch_size);
         result = chunkedBatchDetection(frame, batch_size, false);
         
@@ -459,36 +428,15 @@ TrackingDetectionSystem::localDetection(const cv::Mat& frame) {
             detection_stats_.batch_times.pop_front();
         }
         
-        // Dynamically adjust batch size
         adjustBatchSize();
     }
     
-    // 🔥 Output detection result statistics
     auto final_detections = std::get<0>(result);
     auto roi_detections = std::get<1>(result);
-    
-    // LOG_INFO("🔍 [LocalDetection] Detection complete - total detections: " << final_detections.size() 
-    //          << ", ROIs with detections: " << roi_detections.size());
-    
-    // 🔥 Detailed statistics for each ROI's detection results
-    // for (const auto& [roi_id, detections] : roi_detections) {
-    //     if (!detections.empty()) {
-    //         LOG_INFO("🔍 [LocalDetection] ROI-" << roi_id << " detected " << detections.size() << " targets");
-    //         for (size_t i = 0; i < detections.size(); ++i) {
-    //             const auto& det = detections[i];
-    //             LOG_INFO("  - Target" << (i+1) << ": confidence=" << std::fixed << std::setprecision(3) 
-    //                      << det.confidence << ", position=(" << det.bbox.x << "," << det.bbox.y 
-    //                      << "," << det.bbox.width << "," << det.bbox.height << ")");
-    //         }
-    //     } else {
-    //         LOG_INFO("🔍 [LocalDetection] ROI-" << roi_id << " no detection results");
-    //     }
-    // }
     
     auto end_time = std::chrono::steady_clock::now();
     double inference_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
     
-    // 🔥 Update inference time statistics
     updateInferenceTime(inference_time);
     
     printDetectionSummary(final_detections, inference_time);
@@ -507,42 +455,34 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
         return std::make_tuple(all_detections, roi_detections);
     }
     
-    // 🔥 Execute ROI detection strategy optimization
     optimizeROIDetectionStrategy();
-    
-    // 🔥 Precompute all ROI boundaries
     precomputeROIBounds(frame);
     
-    // 🔥 Pre-allocate memory - more precise estimation
-    int estimated_detections = rois.size() * 3;  // Estimate 3 detections per ROI
+    // Pre-allocate memory: estimate 3 detections per ROI
+    int estimated_detections = rois.size() * 3;
     all_detections.reserve(estimated_detections);
     
-    // 🔥 Start performance timing
     auto batch_start = std::chrono::high_resolution_clock::now();
     
-    // 🔥 Intelligent ROI filtering - skip low priority ROIs
+    // Intelligent ROI filtering: skip low priority ROIs
     std::vector<std::pair<int, cv::Mat>> roi_images;
     std::vector<std::pair<int, cv::Point2i>> roi_offsets;
-    std::vector<std::pair<int, float>> roi_conf_thresholds;  // Adaptive thresholds
+    std::vector<std::pair<int, float>> roi_conf_thresholds;
     std::vector<int> skipped_rois;
     
     roi_images.reserve(rois.size());
     roi_offsets.reserve(rois.size());
     roi_conf_thresholds.reserve(rois.size());
     
-    // 🔥 Phase 1: Intelligent ROI filtering and batch extraction
+    // Phase 1: Intelligent ROI filtering and batch extraction
     auto extraction_start = std::chrono::high_resolution_clock::now();
     
-    // LOG_INFO("🔍 [BatchDetection] Starting batch detection, ROI count: " << rois.size());
-    
     for (const auto& [roi_id, roi] : rois) {
-        // 🔥 Skip condition check
         if (shouldSkipROIDetection(roi_id, *roi)) {
             skipped_rois.push_back(roi_id);
             continue;
         }
         
-        // 🔥 Get adaptive confidence threshold
         float conf_threshold = getAdaptiveConfidenceThreshold(roi_id, *roi);
         
         // 🔥 Extract ROI image
@@ -562,51 +502,32 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
             continue;
         }
         
-        // 🔥 Add to batch processing list
         roi_images.emplace_back(roi_id, roi_image);
         roi_offsets.emplace_back(roi_id, cv::Point2i(x, y));
         roi_conf_thresholds.emplace_back(roi_id, conf_threshold);
-        
-        // LOG_INFO("🔍 [BatchDetection] ROI-" << roi_id << " extraction successful, size: [" << roi_image.cols << " x " << roi_image.rows << "]");
     }
     
     auto extraction_end = std::chrono::high_resolution_clock::now();
     double extraction_time = std::chrono::duration<double, std::milli>(extraction_end - extraction_start).count();
     
-    // LOG_INFO("🔍 [BatchDetection] ROI extraction complete, valid ROIs: " << roi_images.size() 
-    //          << ", skipped ROIs: " << skipped_rois.size() << ", time: " << extraction_time << "ms");
-    
     if (roi_images.empty()) {
-        LOG_WARNING("⚠️ [BatchDetection] No valid ROIs to process");
+        LOG_WARNING("[BatchDetection] No valid ROIs to process");
         return std::make_tuple(all_detections, roi_detections);
     }
     
-    // 🔥 Phase 2: Batch inference decision
+    // Phase 2: Batch inference decision
     auto inference_start = std::chrono::high_resolution_clock::now();
     bool use_batch_inference = true;
     
-    // std::cout << "📊 [Optimized Batch Detection] Total ROIs: " << rois.size() 
-    //           << ", Processing ROIs: " << roi_images.size() 
-    //           << ", Skipped ROIs: " << skipped_rois.size()
-    //           << ", Batch inference supported: " << (use_batch_inference ? "yes" : "no") << std::endl;
-    
-    // if (roi_images.size() < 2) {
-    //     use_batch_inference = false;
-    //     LOG_INFO("🔍 [BatchDetection] ROI count less than 2, using serial inference");
-    // } else 
     if (!local_inference_) {
         use_batch_inference = false;
         LOG_ERROR("❌ [BatchDetection] Inference engine is null, using serial inference");
     } else {
         bool supports_batch = local_inference_->supportsBatchDetection();
         int max_batch_size = local_inference_->getMaxBatchSize();
-        // LOG_INFO("🔍 [BatchDetection] Inference engine supports batch: " << (supports_batch ? "yes" : "no") 
-        //          << ", max batch size: " << max_batch_size);
         
-        if (supports_batch) {
-            // LOG_INFO("🔍 [BatchDetection] Conditions met, using batch inference mode");
-        } else {
-            LOG_WARNING("❌ [BatchDetection] Engine does not support batch, using serial inference mode");
+        if (!supports_batch) {
+            LOG_WARNING("[BatchDetection] Engine does not support batch, using serial inference mode");
             use_batch_inference = false;
         }
     }
@@ -621,20 +542,14 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
                 batch_images.push_back(roi_image);
             }
             
-            // LOG_INFO("🔍 [BatchDetection] Starting batch inference, processing " << batch_images.size() << " ROIs");
-            
             // Execute batch inference
             auto batch_start = std::chrono::high_resolution_clock::now();
             auto batch_results = local_inference_->detectBatch(batch_images, config_.local_conf_thres);
             auto batch_end = std::chrono::high_resolution_clock::now();
             
             double batch_time = std::chrono::duration<double, std::milli>(batch_end - batch_start).count();
-            double time_per_roi = batch_time / batch_images.size();
             
-            // LOG_INFO("🔍 [BatchDetection] Batch inference complete, total time: " << batch_time << "ms, avg per ROI: " 
-            //          << std::fixed << std::setprecision(2) << time_per_roi << "ms");
-            
-            // 🔥 Process batch results
+            // Process batch results
             for (size_t i = 0; i < roi_images.size() && i < batch_results.size(); ++i) {
                 int roi_id = roi_images[i].first;
                 cv::Point2i offset = roi_offsets[i].second;
@@ -642,33 +557,22 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
                 
                 bool has_detection = !roi_detections_local.empty();
                 
-                // LOG_INFO("🔍 [BatchDetection] ROI-" << roi_id << " batch inference results: " 
-                //          << roi_detections_local.size() << " detections");
-                
                 if (has_detection) {
-                    // 🔥 Batch coordinate transformation
+                    // Batch coordinate transformation
                     roi_detections[roi_id].reserve(roi_detections_local.size());
                     for (auto& det : roi_detections_local) {
-                        // Record information before NMS filtering
-                        // LOG_INFO("  - Before NMS: confidence=" << std::fixed << std::setprecision(3) 
-                        //          << det.confidence << ", original position=(" << det.bbox.x << "," << det.bbox.y 
-                        //          << "," << det.bbox.width << "," << det.bbox.height << ")");
-                        
                         // Adjust coordinates
                         det.bbox.x += offset.x;
                         det.bbox.y += offset.y;
                         
                         // Extract appearance features
-                        // Ensure boundary is within image
                         cv::Rect2f bbox = det.bbox;
                         int x = std::max(0, static_cast<int>(bbox.x));
                         int y = std::max(0, static_cast<int>(bbox.y));
                         int width = std::min(static_cast<int>(bbox.width), frame.cols - x);
                         int height = std::min(static_cast<int>(bbox.height), frame.rows - y);
                         
-                        // Check boundary validity
                         if (width > 0 && height > 0) {
-                            // Extract target region
                             cv::Rect valid_rect(x, y, width, height);
                             cv::Mat roi = frame(valid_rect);
                             
@@ -683,41 +587,33 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
                         roi_detections[roi_id].push_back(all_detections.back());
                     }
                     
-                    // LOG_INFO("🔍 [BatchDetection] ROI-" << roi_id << " final detections: " 
-                    //          << roi_detections[roi_id].size() << " targets");
-                    
-                    // 🔥 Update ROI status
+                    // Update ROI status
                     const auto& roi_it = rois.find(roi_id);
                     if (roi_it != rois.end()) {
                         roi_it->second->no_detection_count = 0;
-                        
-                        // Print ROI region size and detection frame count
-                        const auto& roi = roi_it->second;
-                        // LOG_INFO("🔍 [ROI Info] ROI-" << roi_id << ": region size=" << roi->bbox.width << "x" << roi->bbox.height << " (area=" << roi->bbox.area() << "), detection frames=" << roi->no_detection_count << ", detected targets=" << roi_detections[roi_id].size());
                     }
                 } else {
                     roi_detections[roi_id] = {};
-                    // LOG_INFO("🔍 [BatchDetection] ROI-" << roi_id << " no detection results");
                     const auto& roi_it = rois.find(roi_id);
                     if (roi_it != rois.end()) {
                         roi_it->second->no_detection_count++;
                     }
                 }
                 
-                // 🔥 Update ROI detection state
-                updateROIDetectionState(roi_id, has_detection, 0.0); // Batch inference time calculated separately
+                // Update ROI detection state (batch inference time calculated separately)
+                updateROIDetectionState(roi_id, has_detection, 0.0);
             }
             
         } catch (const std::exception& e) {
-            LOG_ERROR("❌ [BatchDetection] Batch inference error: " << e.what());
-            LOG_INFO("🔄 Automatically falling back to serial inference mode");
+            LOG_ERROR("[BatchDetection] Batch inference error: " << e.what());
+            LOG_INFO("Automatically falling back to serial inference mode");
             use_batch_inference = false;
         }
     }
     
     if (!use_batch_inference) {
         // Serial inference mode
-        LOG_INFO("🔄 Using serial inference to process " << roi_images.size() << " ROIs");
+        LOG_INFO("Using serial inference to process " << roi_images.size() << " ROIs");
         
         auto serial_start = std::chrono::high_resolution_clock::now();
         double total_detection_time = 0.0;
@@ -727,9 +623,6 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
             const cv::Mat& roi_image = roi_images[i].second;
             float conf_threshold = roi_conf_thresholds[i].second;
             
-            // LOG_INFO("🔍 [SerialDetection] Processing ROI-" << roi_id << ", confidence threshold: " 
-            //          << std::fixed << std::setprecision(3) << conf_threshold);
-            
             auto detection_start = std::chrono::high_resolution_clock::now();
             auto roi_detections_local = local_inference_->detect(roi_image, conf_threshold);
             auto detection_end = std::chrono::high_resolution_clock::now();
@@ -738,40 +631,26 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
             
             bool has_detection = !roi_detections_local.empty();
             
-            // LOG_INFO("🔍 [SerialDetection] ROI-" << roi_id << " serial inference results: " 
-            //          << roi_detections_local.size() << " detections, time: " << detection_time << "ms");
-            
             if (has_detection) {
-                // Get corresponding offset
                 cv::Point2i offset = roi_offsets[i].second;
                 
                 // Coordinate transformation
                 roi_detections[roi_id].reserve(roi_detections_local.size());
                 for (auto& det : roi_detections_local) {
-                    // Record information before NMS filtering
-                    // LOG_INFO("  - Before NMS: confidence=" << std::fixed << std::setprecision(3) 
-                    //          << det.confidence << ", original position=(" << det.bbox.x << "," << det.bbox.y 
-                    //          << "," << det.bbox.width << "," << det.bbox.height << ")");
-                    
-                    // Adjust coordinates
                     det.bbox.x += offset.x;
                     det.bbox.y += offset.y;
                     
                     // Extract appearance features
-                    // Ensure boundary is within image
                     cv::Rect2f bbox = det.bbox;
                     int x = std::max(0, static_cast<int>(bbox.x));
                     int y = std::max(0, static_cast<int>(bbox.y));
                     int width = std::min(static_cast<int>(bbox.width), frame.cols - x);
                     int height = std::min(static_cast<int>(bbox.height), frame.rows - y);
                     
-                    // Check boundary validity
                     if (width > 0 && height > 0) {
-                        // Extract target region
                         cv::Rect valid_rect(x, y, width, height);
                         cv::Mat roi = frame(valid_rect);
                         
-                        // Resize to standard size and store
                         cv::Mat appearance;
                         cv::resize(roi, appearance, cv::Size(64, 64));
                         det.appearance = appearance.clone();
@@ -781,34 +660,24 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
                     roi_detections[roi_id].push_back(all_detections.back());
                 }
                 
-                // LOG_INFO("🔍 [SerialDetection] ROI-" << roi_id << " final detections: " 
-                //          << roi_detections[roi_id].size() << " targets");
-                
-                // Update ROI status
                 const auto& roi_it = rois.find(roi_id);
                 if (roi_it != rois.end()) {
                     roi_it->second->no_detection_count = 0;
-                    
-                    // Print ROI region size and detection frame count
-                    const auto& roi = roi_it->second;
-                    // LOG_INFO("🔍 [ROI Info] ROI-" << roi_id << ": region size=" << roi->bbox.width << "x" << roi->bbox.height << " (area=" << roi->bbox.area() << "), detection frames=" << roi->no_detection_count << ", detected targets=" << roi_detections[roi_id].size());
                 }
             } else {
                 roi_detections[roi_id] = {};
-                // LOG_INFO("🔍 [SerialDetection] ROI-" << roi_id << " no detection results");
                 const auto& roi_it = rois.find(roi_id);
                 if (roi_it != rois.end()) {
                     roi_it->second->no_detection_count++;
                 }
             }
             
-            // Update ROI detection state
             updateROIDetectionState(roi_id, has_detection, detection_time);
         }
         
         auto serial_end = std::chrono::high_resolution_clock::now();
         double serial_total_time = std::chrono::duration<double, std::milli>(serial_end - serial_start).count();
-        LOG_INFO("🔄 Serial inference complete: total time " << serial_total_time << "ms, avg per ROI: " 
+        LOG_INFO("Serial inference complete: total time " << serial_total_time << "ms, avg per ROI: " 
                  << std::fixed << std::setprecision(2) << (serial_total_time / roi_images.size()) << "ms");
     }
     
@@ -832,14 +701,11 @@ TrackingDetectionSystem::optimizedBatchDetection(const cv::Mat& frame, bool verb
 void TrackingDetectionSystem::handleGlobalPhase(std::vector<std::unique_ptr<STrack>>& tracks,
                                               const std::vector<Detection>& detections,
                                               int frame_width, int frame_height) {
-    // 🔥 When using global detection only mode, skip ROI creation and management
+    // When using global detection only mode, skip ROI creation and management
     if (detection_mode_ == 0) {
-        // Global detection only mode, don't create or manage ROI
         LOG_INFO("Global detection only mode: Skip ROI creation and management");
         return;
     }
-    
-    // Following is the logic for global + local joint detection mode
     
     // 1. Create ROI for newly confirmed tracks
     for (const auto& track : tracks) {
@@ -852,10 +718,8 @@ void TrackingDetectionSystem::handleGlobalPhase(std::vector<std::unique_ptr<STra
     }
     
     // 2. Unified ROI management (position update, merge, split, cleanup)
-    // 🔥 Start ROI adjustment time measurement
     auto roi_adjustment_start = std::chrono::high_resolution_clock::now();
     
-    // ROI dynamic management
     roi_manager_->dynamicROIManagement(tracks, frame_width, frame_height, current_frame_id_);
     
     // Update candidate targets
@@ -881,15 +745,12 @@ void TrackingDetectionSystem::handleGlobalPhase(std::vector<std::unique_ptr<STra
     auto roi_adjustment_end = std::chrono::high_resolution_clock::now();
     double roi_adjustment_time = std::chrono::duration<double, std::milli>(roi_adjustment_end - roi_adjustment_start).count();
     updateROIAdjustmentTime(roi_adjustment_time);
-    
-
 }
 
 void TrackingDetectionSystem::handleLocalPhase(std::vector<std::unique_ptr<STrack>>& updated_tracks, 
                                               int frame_width, int frame_height) {
-    // First check if there are valid ROIs and tracks
     if (roi_manager_->getROIs().empty()) {
-        LOG_WARNING("⚠️ Frame " << current_frame_id_ << ": No valid ROI in local phase, forcing switch to global phase");
+        LOG_WARNING("Frame " << current_frame_id_ << ": No valid ROI in local phase, forcing switch to global phase");
         activateForceGlobalPhase();
         return;
     }
@@ -904,15 +765,12 @@ void TrackingDetectionSystem::handleLocalPhase(std::vector<std::unique_ptr<STrac
     }
     
     if (!has_active_tracks) {
-        LOG_WARNING("⚠️ Frame " << current_frame_id_ << ": No active tracks in local phase, suggesting switch to global detection for next frame");
-        // Don't switch immediately here, switch when no targets and no tracks detected in process method
+        LOG_WARNING("Frame " << current_frame_id_ << ": No active tracks in local phase, suggesting switch to global detection for next frame");
     }
     
-    // Normal local phase ROI management
-    // 🔥 Start ROI adjustment time measurement
+    // Local phase ROI management
     auto roi_adjustment_start = std::chrono::high_resolution_clock::now();
     
-    // Local phase ROI management
     auto stats = roi_manager_->localPhaseROIManagement(updated_tracks, frame_width, frame_height, current_frame_id_);
     
     // Update ROI status and cleanup inactive ROIs
@@ -923,12 +781,10 @@ void TrackingDetectionSystem::handleLocalPhase(std::vector<std::unique_ptr<STrac
     double roi_adjustment_time = std::chrono::duration<double, std::milli>(roi_adjustment_end - roi_adjustment_start).count();
     updateROIAdjustmentTime(roi_adjustment_time);
     
-    // Record ROI count change
     num_rois_ = roi_manager_->getROIs().size();
     
-    // Check ROI count again, if 0 then switch to global phase
     if (num_rois_ == 0) {
-        LOG_WARNING("⚠️ Frame " << current_frame_id_ << ": No valid ROI after local phase ROI management, forcing switch to global phase");
+        LOG_WARNING("Frame " << current_frame_id_ << ": No valid ROI after local phase ROI management, forcing switch to global phase");
         activateForceGlobalPhase();
     }
 }
@@ -1010,12 +866,11 @@ cv::Mat TrackingDetectionSystem::visualize(const cv::Mat& frame, const std::vect
         // Check if track is actually lost
         bool is_test_lost = track->isLost();
         
-        // 1. Draw current position of all tracks (regardless of state)
+        // Draw current position of all tracks
         cv::Point2f current_pos = track->center();
         cv::Rect track_rect(static_cast<int>(track->tlwh.x), static_cast<int>(track->tlwh.y),
                            static_cast<int>(track->tlwh.width), static_cast<int>(track->tlwh.height));
         
-        // 🔥 Generate unique color for each ID
         cv::Scalar base_color = generateColorForID(track->displayId());
         cv::Scalar color = adjustColorForState(base_color, track->is_confirmed, track->is_recovered, is_test_lost);
         
@@ -1046,9 +901,8 @@ cv::Mat TrackingDetectionSystem::visualize(const cv::Mat& frame, const std::vect
                        cv::FONT_HERSHEY_SIMPLEX, 0.8, color, 2);
         }
         
-        // 2. Draw historical trajectory lines for all tracks (whether lost or not)
+        // Draw historical trajectory lines for all tracks
         if (track->position_history.size() > 1) {
-            // 🔥 Draw trajectory lines using ID-corresponding color
             cv::Scalar line_color = is_test_lost ? cv::Scalar(128, 128, 128) : base_color;
             int line_thickness = track->is_confirmed ? 2 : 1;
             
@@ -1095,38 +949,34 @@ cv::Mat TrackingDetectionSystem::visualize(const cv::Mat& frame, const std::vect
             }
         }
         
-        // 4. Draw small circles at current position of all tracks
+        // Draw small circles at current position of all tracks
         if (track->isLost() || is_test_lost) {
-            // 🔥 Lost tracks use ID-corresponding color
             cv::circle(vis_frame, current_pos, 6, base_color, -1);
             std::string lost_label = "Lost-" + std::to_string(track->displayId());
             cv::putText(vis_frame, lost_label, cv::Point(current_pos.x + 8, current_pos.y), 
                        cv::FONT_HERSHEY_SIMPLEX, 0.4, base_color, 1);
         } else {
-            //  Active track's current position uses ID-corresponding color
             cv::circle(vis_frame, current_pos, 3, base_color, -1);
         }
     }
     
-    // 🔥 Draw ROI and safety zones
+    // Draw ROI and safety zones
     for (const auto& [roi_id, roi] : roi_manager_->getROIs()) {
-        // ROI outer boundary - uniformly use yellow
-        cv::Scalar roi_color = cv::Scalar(0, 255, 255);  // Uniformly use yellow
-        int roi_thickness = roi->is_merged ? 3 : 2;      // Still keep different thickness to distinguish status
+        cv::Scalar roi_color = cv::Scalar(0, 255, 255);
+        int roi_thickness = roi->is_merged ? 3 : 2;
         cv::rectangle(vis_frame, roi->bbox, roi_color, roi_thickness);
         
-        // 🔥 Safety zone drawing - uniformly use yellow
+        // Safety zone drawing
         cv::Rect safety_bbox = roi->safetyBbox();
-        cv::Scalar safe_color = cv::Scalar(0, 255, 255);  // Uniformly use yellow
+        cv::Scalar safe_color = cv::Scalar(0, 255, 255);
         drawDashedRectangle(vis_frame, safety_bbox.tl(), safety_bbox.br(), safe_color, 1, 5, 3);
         
-        // 🔥 ROI information - display memory count and safety zone status
+        // ROI information: display memory count and safety zone status
         int lost_count = 0;
         for (const auto& [track_id, memory] : roi->track_memories) {
             if (memory->lost_duration > 0) lost_count++;
         }
         
-        // Check if current targets are within safety zone
         std::vector<cv::Point2f> current_track_centers;
         for (const auto& track : tracks) {
             if (track->roi_id == roi_id && track->is_activated) {
@@ -1150,7 +1000,7 @@ cv::Mat TrackingDetectionSystem::visualize(const cv::Mat& frame, const std::vect
                    cv::FONT_HERSHEY_SIMPLEX, 0.4, roi_color, 1);
     }
     
-    // 🔥 Display status information - add ID statistics
+    // Display status information
     int confirmed_tracks = 0, temp_tracks = 0;
     for (const auto& track : tracks) {
         if (track->is_confirmed) confirmed_tracks++;
@@ -1320,7 +1170,7 @@ std::vector<Detection> TrackingDetectionSystem::globalDetectionWithMotion(const 
                     detections = global_inference_->detect(frame, config_.global_conf_thres);
                 }
             } catch (const std::exception& e) {
-                std::cout << "⚠️ [Global detection] Double frame detection failed: " << e.what() << ", fall back to single frame detection" << std::endl;
+                std::cout << "[Global detection] Double frame detection failed: " << e.what() << ", fall back to single frame detection" << std::endl;
                 detections = global_inference_->detect(frame, config_.global_conf_thres);
             }
         } else {
@@ -1337,7 +1187,7 @@ std::vector<Detection> TrackingDetectionSystem::globalDetectionWithMotion(const 
                 }
             } else {
                 // Frame size mismatch
-                std::cout << "⚠️ [Global detection] Frame size mismatch, use single frame detection" << std::endl;
+                std::cout << "[Global detection] Frame size mismatch, use single frame detection" << std::endl;
                 detections = global_inference_->detect(frame, config_.global_conf_thres);
             }
         }
@@ -1372,7 +1222,7 @@ std::vector<Detection> TrackingDetectionSystem::globalDetectionWithMotion(const 
             double appearance_time = std::chrono::duration<double, std::milli>(appearance_end - appearance_start).count();
             
             if (frame_count_ % 50 == 0 && appearance_count > 0) {
-                LOG_INFO("📸 [Global motion detection appearance extraction] Frame " << frame_count_ << ": " 
+                LOG_INFO("[Global motion detection appearance extraction] Frame " << frame_count_ << ": " 
                          << appearance_count << " targets, time: " << std::fixed << std::setprecision(2) 
                          << appearance_time << "ms (average" << std::fixed << std::setprecision(2) 
                          << (appearance_time/appearance_count) << "ms/target)");
@@ -1474,7 +1324,7 @@ void TrackingDetectionSystem::printGlobalDetectionSummary(const std::vector<Dete
     //           << gpu_info << std::endl;
 }
 
-// 🔥 Print key tracking results (bypasses log_level, always visible)
+// Print key tracking results (bypasses log_level, always visible)
 void TrackingDetectionSystem::printKeyTrackingResults(int frame_id, const std::vector<Detection>& detections,
                                                       const std::vector<std::unique_ptr<STrack>>& tracks) {
     // Use std::cout instead of LOG_INFO to bypass log_level filtering
@@ -1483,14 +1333,11 @@ void TrackingDetectionSystem::printKeyTrackingResults(int frame_id, const std::v
     std::ostringstream oss;
     oss << "Frame: " << frame_id;
     
-    // Add mode info (changed from "Phase" to "Mode")
     std::string mode = isGlobalPhase() ? "GLOBAL" : "LOCAL";
     oss << ", Mode: " << mode;
-    
-    // Add detection count
     oss << ", Detections: " << detections.size();
     
-    // 🔥 Enhanced: Count tracks by state
+    // Count tracks by state
     std::vector<int> active_track_ids;
     std::vector<int> recovered_track_ids;
     std::vector<int> temp_track_ids;
@@ -1520,7 +1367,7 @@ void TrackingDetectionSystem::printKeyTrackingResults(int frame_id, const std::v
         oss << " (Lost: " << lost_tracks << ")";
     }
     
-    // 🔥 Print recovered tracks if any
+    // Print recovered tracks if any
     if (!recovered_track_ids.empty()) {
         oss << " [RECOVERED: ";
         for (size_t i = 0; i < recovered_track_ids.size(); ++i) {
@@ -1534,12 +1381,10 @@ void TrackingDetectionSystem::printKeyTrackingResults(int frame_id, const std::v
     if (!active_track_ids.empty()) {
         oss << " | Targets: ";
         
-        // Sort track IDs for consistent output
         std::sort(active_track_ids.begin(), active_track_ids.end());
         
         bool first = true;
         for (int track_id : active_track_ids) {
-            // Find the track
             const STrack* track_ptr = nullptr;
             for (const auto& track : tracks) {
                 if (track && track->displayId() == track_id) {
@@ -1552,9 +1397,8 @@ void TrackingDetectionSystem::printKeyTrackingResults(int frame_id, const std::v
                 if (!first) oss << ", ";
                 first = false;
                 
-                // Format: ID[x,y,w,h] with recovery marker
                 oss << "ID" << track_id;
-                if (track_ptr->is_recovered) oss << "(R)";  // Mark recovered tracks
+                if (track_ptr->is_recovered) oss << "(R)";
                 oss << "["
                     << std::fixed << std::setprecision(0)
                     << track_ptr->tlwh.x << ","
@@ -1567,7 +1411,7 @@ void TrackingDetectionSystem::printKeyTrackingResults(int frame_id, const std::v
         oss << " | Targets: None";
     }
     
-    // 🔥 Print temporary tracks if any
+    // Print temporary tracks if any
     if (!temp_track_ids.empty()) {
         oss << " | Temp: ";
         std::sort(temp_track_ids.begin(), temp_track_ids.end());
@@ -1577,7 +1421,6 @@ void TrackingDetectionSystem::printKeyTrackingResults(int frame_id, const std::v
         }
     }
     
-    // Output to console (bypasses log filtering)
     std::cout << oss.str() << std::endl;
 }
 
@@ -1807,7 +1650,7 @@ void TrackingDetectionSystem::printTrackingInfo(const std::vector<std::unique_pt
         }
         LOG_INFO("  Lost memory: " << lost_memories);
         
-        // 统计当前ROI中的轨迹
+        // Count current tracks in ROI
         int roi_tracks = 0;
         for (const auto& track : tracks) {
             if (track && track->roi_id == roi_id) roi_tracks++;
@@ -2125,7 +1968,7 @@ void TrackingDetectionSystem::saveFrameResults(const std::vector<std::unique_ptr
             track->tlwh.width,                   // width
             track->tlwh.height,                  // height
             track->score,                        // confidence
-            0,                                   // class_id (假设都是无人机，类别0)
+            0,                                   // class_id (assume all are drones, class 0)
             track->is_confirmed                  // is_confirmed
         );
         
@@ -2145,9 +1988,9 @@ void TrackingDetectionSystem::initializeThreadLocalInferences(int num_threads) {
         try {
             // Use local detection model path to create thread local inference engine
             thread_local_inferences_[i] = createLocalInferenceEngine(local_model_path_);
-            std::cout << "✅ Thread " << i << " local inference engine initialized successfully" << std::endl;
+            std::cout << "Thread " << i << " local inference engine initialized successfully" << std::endl;
         } catch (const std::exception& e) {
-            std::cerr << "❌ Thread " << i << " local inference engine initialization failed: " << e.what() << std::endl;
+            std::cerr << "Thread " << i << " local inference engine initialization failed: " << e.what() << std::endl;
         }
     }
     
@@ -2416,7 +2259,7 @@ void TrackingDetectionSystem::printPerformanceReport() {
     // std::cout << "ROI state: " << active_rois << " high priority, " 
     //           << low_priority_rois << " low priority" << std::endl;
     
-    // 🔥 Comment out separator line to avoid interrupting frame output
+    // Comment out separator line to avoid interrupting frame output
     // std::cout << "================================================\n" << std::endl;
 }
 
@@ -2502,8 +2345,8 @@ float TrackingDetectionSystem::getAdaptiveConfidenceThreshold(int roi_id, const 
         return std::max(0.3f, config_.local_conf_thres - 0.1f);
     }
     
-    // If ROI detection time is long, can slightly increase threshold to reduce post-processing
-    if (state.avg_detection_time > 50.0) {  // 超过50ms
+    // If ROI detection time is long, slightly increase threshold to reduce post-processing
+    if (state.avg_detection_time > 50.0) {
         return std::min(0.8f, config_.local_conf_thres + 0.05f);
     }
     
@@ -2561,7 +2404,7 @@ void TrackingDetectionSystem::updateROIDetectionState(int roi_id, bool has_detec
         }
     }
     
-    // Dynamic adjustment maximum skip frame - more精细的策略
+    // Dynamic adjustment maximum skip frame - more refined strategy
     if (state.avg_detection_time > 40.0) {  // Very slow detection
         state.max_skip_frames = std::min(8, state.max_skip_frames + 1);
     } else if (state.avg_detection_time > 25.0) {  // Slower detection
@@ -2604,8 +2447,8 @@ void TrackingDetectionSystem::optimizeROIDetectionStrategy() {
                     state.max_skip_frames = std::min(8, state.max_skip_frames + 2);
                 }
             }
-            // std::cout << "🚀 Enable aggressive skip frame mode: " << low_activity_ratio * 100 
-            //           << "% ROI低活跃度" << std::endl;
+            // std::cout << "Enable aggressive skip frame mode: " << low_activity_ratio * 100 
+            //           << "% ROI low activity" << std::endl;
         } else if (low_activity_ratio < 0.2) {
             // Less than 20% of ROI active low, reduce skip frame
             for (auto& [roi_id, state] : roi_detection_states_) {
@@ -2706,7 +2549,7 @@ TrackingDetectionSystem::~TrackingDetectionSystem() {
 // Activate force global detection mode
 void TrackingDetectionSystem::activateForceGlobalPhase() {
     if (!force_global_phase_) {
-        LOG_WARNING("⚠️ Frame " << current_frame_id_ << ": Activate force global phase");
+        LOG_WARNING("Frame " << current_frame_id_ << ": Activate force global phase");
         force_global_phase_ = true;
         force_global_start_frame_ = frame_count_;
         
@@ -2742,7 +2585,7 @@ void TrackingDetectionSystem::handleForceGlobalPhaseEnd() {
         // Ensure at least one valid ROI exists before exiting global phase
         const auto& rois = roi_manager_->getROIs();
         if (rois.empty()) {
-            LOG_WARNING("⚠️ Force global phase ends with no valid ROI, continue with global phase");
+            LOG_WARNING("Force global phase ends with no valid ROI, continue with global phase");
             activateForceGlobalPhase();
         }
     }
@@ -3021,6 +2864,235 @@ cv::Scalar TrackingDetectionSystem::adjustColorForState(cv::Scalar base_color, b
             static_cast<int>(base_color[2] * 0.7)
         );
     }
+}
+
+// Log tracking input state (Global phase)
+void TrackingDetectionSystem::logTrackingInputState(const std::vector<Detection>& detections, int frame_id) {
+    LOG_INFO("========================================");
+    LOG_INFO("[Tracking Input] Frame " << frame_id << " (GLOBAL Phase)");
+    LOG_INFO("========================================");
+    
+    if (tracker_) {
+        const auto& active_tracks = tracker_->getActiveTracks();
+        const auto& lost_tracks = tracker_->getLostTracks();
+        
+        LOG_INFO("[Pre-Update Tracker State]");
+        LOG_INFO("  Active tracks: " << active_tracks.size());
+        LOG_INFO("  Lost tracks: " << lost_tracks.size());
+        
+        if (!active_tracks.empty()) {
+            LOG_INFO("  Active Tracks Details:");
+            for (const auto& track : active_tracks) {
+                if (!track) continue;
+                LOG_INFO("    ID-" << track->displayId() 
+                         << " | State: " << (track->is_confirmed ? "Confirmed" : "Tentative")
+                         << " | Score: " << std::fixed << std::setprecision(3) << track->score
+                         << " | Pos: [" << std::fixed << std::setprecision(1) 
+                         << track->tlwh.x << "," << track->tlwh.y << ","
+                         << track->tlwh.width << "," << track->tlwh.height << "]"
+                         << " | Len: " << track->tracklet_len
+                         << " | ROI: " << track->roi_id);
+            }
+        }
+        
+        if (!lost_tracks.empty()) {
+            LOG_INFO("  Lost Tracks Details:");
+            for (const auto& track : lost_tracks) {
+                if (!track) continue;
+                LOG_INFO("    ID-" << track->displayId() 
+                         << " | Lost for: " << track->lost_frames_count << " frames"
+                         << " | Last Pos: [" << std::fixed << std::setprecision(1) 
+                         << track->tlwh.x << "," << track->tlwh.y << ","
+                         << track->tlwh.width << "," << track->tlwh.height << "]"
+                         << " | ROI: " << track->roi_id);
+            }
+        }
+    }
+    
+    LOG_INFO("[Input Detections]: " << detections.size() << " detections");
+    if (!detections.empty()) {
+        for (size_t i = 0; i < detections.size(); ++i) {
+            const auto& det = detections[i];
+            LOG_INFO("  Det[" << i << "] Conf: " << std::fixed << std::setprecision(3) << det.confidence
+                     << " | Pos: [" << std::fixed << std::setprecision(1)
+                     << det.bbox.x << "," << det.bbox.y << ","
+                     << det.bbox.width << "," << det.bbox.height << "]"
+                     << " | Center: (" << det.center().x << "," << det.center().y << ")");
+        }
+    }
+    LOG_INFO("========================================");
+}
+
+// Log tracking input state (Local phase with ROI info)
+void TrackingDetectionSystem::logTrackingInputStateLocal(
+    const std::vector<Detection>& detections,
+    const std::unordered_map<int, std::vector<Detection>>& roi_detections,
+    int frame_id) {
+    
+    LOG_INFO("========================================");
+    LOG_INFO("[Tracking Input] Frame " << frame_id << " (LOCAL Phase)");
+    LOG_INFO("========================================");
+    
+    if (tracker_) {
+        const auto& active_tracks = tracker_->getActiveTracks();
+        const auto& lost_tracks = tracker_->getLostTracks();
+        
+        LOG_INFO("[Pre-Update Tracker State]");
+        LOG_INFO("  Active tracks: " << active_tracks.size());
+        LOG_INFO("  Lost tracks: " << lost_tracks.size());
+        
+        if (!active_tracks.empty()) {
+            LOG_INFO("  Active Tracks Details:");
+            for (const auto& track : active_tracks) {
+                if (!track) continue;
+                LOG_INFO("    ID-" << track->displayId() 
+                         << " | State: " << (track->is_confirmed ? "Confirmed" : "Tentative")
+                         << " | Score: " << std::fixed << std::setprecision(3) << track->score
+                         << " | Pos: [" << std::fixed << std::setprecision(1) 
+                         << track->tlwh.x << "," << track->tlwh.y << ","
+                         << track->tlwh.width << "," << track->tlwh.height << "]"
+                         << " | Len: " << track->tracklet_len
+                         << " | ROI: " << track->roi_id);
+            }
+        }
+        
+        if (!lost_tracks.empty()) {
+            LOG_INFO("  Lost Tracks Details:");
+            for (const auto& track : lost_tracks) {
+                if (!track) continue;
+                LOG_INFO("    ID-" << track->displayId() 
+                         << " | Lost for: " << track->lost_frames_count << " frames"
+                         << " | Last Pos: [" << std::fixed << std::setprecision(1) 
+                         << track->tlwh.x << "," << track->tlwh.y << ","
+                         << track->tlwh.width << "," << track->tlwh.height << "]"
+                         << " | ROI: " << track->roi_id);
+            }
+        }
+    }
+    
+    const auto& rois = roi_manager_->getROIs();
+    LOG_INFO("[Active ROIs]: " << rois.size() << " ROIs");
+    for (const auto& [roi_id, roi] : rois) {
+        LOG_INFO("  ROI-" << roi_id 
+                 << " | Bbox: [" << roi->bbox.x << "," << roi->bbox.y << ","
+                 << roi->bbox.width << "," << roi->bbox.height << "]"
+                 << " | Tracks: " << roi->track_ids.size()
+                 << " | Memories: " << roi->track_memories.size());
+    }
+    
+    LOG_INFO("[Input Detections]: " << detections.size() << " total detections");
+    LOG_INFO("  Detections by ROI:");
+    for (const auto& [roi_id, roi_dets] : roi_detections) {
+        LOG_INFO("    ROI-" << roi_id << ": " << roi_dets.size() << " detections");
+        for (size_t i = 0; i < roi_dets.size(); ++i) {
+            const auto& det = roi_dets[i];
+            LOG_INFO("      Det[" << i << "] Conf: " << std::fixed << std::setprecision(3) << det.confidence
+                     << " | Pos: [" << std::fixed << std::setprecision(1)
+                     << det.bbox.x << "," << det.bbox.y << ","
+                     << det.bbox.width << "," << det.bbox.height << "]");
+        }
+    }
+    LOG_INFO("========================================");
+}
+
+// Log tracking output state (after update)
+void TrackingDetectionSystem::logTrackingOutputState(
+    const std::vector<std::unique_ptr<STrack>>& tracks, int frame_id) {
+    
+    LOG_INFO("========================================");
+    LOG_INFO("[Tracking Output] Frame " << frame_id);
+    LOG_INFO("========================================");
+    
+    // Classify tracks by state
+    std::vector<const STrack*> confirmed_tracks;
+    std::vector<const STrack*> tentative_tracks;
+    std::vector<const STrack*> recovered_tracks;
+    std::vector<const STrack*> lost_tracks;
+    
+    for (const auto& track : tracks) {
+        if (!track) continue;
+        
+        if (track->isLost()) {
+            lost_tracks.push_back(track.get());
+        } else if (track->is_recovered) {
+            recovered_tracks.push_back(track.get());
+        } else if (track->is_confirmed) {
+            confirmed_tracks.push_back(track.get());
+        } else if (track->is_activated) {
+            tentative_tracks.push_back(track.get());
+        }
+    }
+    
+    LOG_INFO("[Track Summary]");
+    LOG_INFO("  Confirmed: " << confirmed_tracks.size());
+    LOG_INFO("  Tentative: " << tentative_tracks.size());
+    LOG_INFO("  Recovered: " << recovered_tracks.size());
+    LOG_INFO("  Lost: " << lost_tracks.size());
+    
+    if (!confirmed_tracks.empty()) {
+        LOG_INFO("  Confirmed Tracks:");
+        for (const auto* track : confirmed_tracks) {
+            LOG_INFO("    ID-" << track->displayId() 
+                     << " | Score: " << std::fixed << std::setprecision(3) << track->score
+                     << " | Pos: [" << std::fixed << std::setprecision(1)
+                     << track->tlwh.x << "," << track->tlwh.y << ","
+                     << track->tlwh.width << "," << track->tlwh.height << "]"
+                     << " | Len: " << track->tracklet_len
+                     << " | ConfFrames: " << track->confirmation_frames
+                     << " | ROI: " << track->roi_id
+                     << " | Quality: " << std::fixed << std::setprecision(3) << track->quality_score);
+        }
+    }
+    
+    if (!tentative_tracks.empty()) {
+        LOG_INFO("  Tentative Tracks (New/Unconfirmed):");
+        for (const auto* track : tentative_tracks) {
+            LOG_INFO("    ID-" << track->displayId() 
+                     << " | Score: " << std::fixed << std::setprecision(3) << track->score
+                     << " | Pos: [" << std::fixed << std::setprecision(1)
+                     << track->tlwh.x << "," << track->tlwh.y << ","
+                     << track->tlwh.width << "," << track->tlwh.height << "]"
+                     << " | Len: " << track->tracklet_len
+                     << " | ConfFrames: " << track->confirmation_frames << "/" << track->min_confirmation_frames
+                     << " | ROI: " << track->roi_id);
+        }
+    }
+    
+    if (!recovered_tracks.empty()) {
+        LOG_INFO("  Recovered Tracks:");
+        for (const auto* track : recovered_tracks) {
+            LOG_INFO("    ID-" << track->displayId() 
+                     << " | Score: " << std::fixed << std::setprecision(3) << track->score
+                     << " | RecoveryConf: " << std::fixed << std::setprecision(3) << track->recovery_confidence
+                     << " | Pos: [" << std::fixed << std::setprecision(1)
+                     << track->tlwh.x << "," << track->tlwh.y << ","
+                     << track->tlwh.width << "," << track->tlwh.height << "]"
+                     << " | Len: " << track->tracklet_len
+                     << " | ROI: " << track->roi_id);
+        }
+    }
+    
+    if (!lost_tracks.empty()) {
+        LOG_INFO("  Lost Tracks:");
+        for (const auto* track : lost_tracks) {
+            LOG_INFO("    ID-" << track->displayId() 
+                     << " | Lost for: " << track->lost_frames_count << " frames"
+                     << " | Last Pos: [" << std::fixed << std::setprecision(1)
+                     << track->tlwh.x << "," << track->tlwh.y << ","
+                     << track->tlwh.width << "," << track->tlwh.height << "]"
+                     << " | ROI: " << track->roi_id);
+        }
+    }
+    
+    if (tracker_) {
+        const auto& all_active = tracker_->getActiveTracks();
+        const auto& all_lost = tracker_->getLostTracks();
+        LOG_INFO("  [Tracker Internal State]");
+        LOG_INFO("    Total active tracks in tracker: " << all_active.size());
+        LOG_INFO("    Total lost tracks in tracker: " << all_lost.size());
+    }
+    
+    LOG_INFO("========================================");
 }
 
 } // namespace tracking

@@ -171,7 +171,7 @@ public:
     }
 };
 
-// 静态成员定义
+// Static member definition
 std::mutex ThreadSafePreprocessManager::manager_mutex_;
 std::unordered_map<std::thread::id, std::unique_ptr<ThreadPreprocessContext>> ThreadSafePreprocessManager::contexts_;
 
@@ -341,7 +341,7 @@ int cuda_preprocess_thread_safe(uint8_t *src, int src_width, int src_height,
             return -1;
         }
 
-        // 为输出分配staging缓冲区 (float)
+        // Allocate staging buffer for output (float)
         size_t output_bytes = dst_width * dst_height * 3 * sizeof(float);
         if (!ctx->ensure_staging(output_bytes)) {
             std::cerr << "❌ Allocate staging buffer failed" << std::endl;
@@ -506,7 +506,7 @@ void process_input_cpu(cv::Mat& src, float* input_device_buffer) {
                          kInputH * kInputW * 3 * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-// 🔥 New: high-performance ROI preprocess function
+
 void cuda_preprocess_roi_safe(uint8_t* src, int src_width, int src_height,
                              float* dst, int dst_width, int dst_height,
                              void* temp_buffer, cudaStream_t stream) {
@@ -557,6 +557,28 @@ void process_roi_gpu(const cv::Mat& roi_in, float* output, void*, cudaStream_t) 
                                          output, kInputW, kInputH);
     if (ret != 0) {
         throw std::runtime_error("ROI preprocess failed");
+    }
+}
+
+// 🔥 Support GPU preprocess with specified stream (for multi-stream parallel)
+void process_input_gpu_stream(const cv::Mat& src, float* output, void* temp_buffer, cudaStream_t stream) {
+    try {
+        // Ensure image is continuous
+        cv::Mat image;
+        if (src.isContinuous()) {
+            image = src;
+        } else {
+            image = src.clone();
+        }
+        
+        // Use cuda_preprocess_roi_safe, it supports stream parameter
+        cuda_preprocess_roi_safe(image.ptr(), image.cols, image.rows,
+                                output, kInputW, kInputH,
+                                temp_buffer, stream);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "❌ [process_input_gpu_stream] Exception: " << e.what() << std::endl;
+        throw;
     }
 }
 

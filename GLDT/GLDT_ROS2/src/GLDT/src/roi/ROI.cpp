@@ -141,13 +141,13 @@ cv::Rect ROI::validateBounds(int frame_width, int frame_height) const {
 bool ROI::shouldMergeWith(const ROI& other) const {
 
     float overlap_ratio = calculateOverlapRatio(other);
-    return overlap_ratio > 0.05f;  // 重合面积超过20%才合并
+    return overlap_ratio > 0.05f; 
 }
 
 bool ROI::shouldSplit(const std::vector<cv::Point2f>& track_centers, int base_size) const {
 
     if (track_centers.size() < 2) {
-        // LOG_INFO("    目标数量不足(" << track_centers.size() << " < 2)，不分割");
+        // LOG_INFO("    Target number insufficient (" << track_centers.size() << " < 2), not splitting");
         return false;
     }
     
@@ -320,7 +320,7 @@ bool ROI::adaptiveUpdateWithTrackInfo(const std::vector<std::pair<cv::Point2f, c
         }
 
 
-        float max_shrink_ratio = has_safety_violations ? 0.05f : 0.15f; // 安全违规时只允许5%收缩
+        float max_shrink_ratio = has_safety_violations ? 0.05f : 0.15f; // Safety violation only allows 5% shrinkage
         int min_width = static_cast<int>(bbox.width * (1.0f - max_shrink_ratio));
         int min_height = static_cast<int>(bbox.height * (1.0f - max_shrink_ratio));
         desired_width = std::max(desired_width, min_width);
@@ -507,7 +507,7 @@ std::vector<cv::Rect> ROI::generateSplitConfigs(const std::vector<cv::Point2f>& 
         return {};
     }
     
-    // 步骤2: 为每个聚类创建ROI
+    // Step 2: Create ROI for each cluster
     std::vector<cv::Rect> candidate_rois;
     for (size_t cluster_idx = 0; cluster_idx < clusters.size(); ++cluster_idx) {
         const auto& cluster = clusters[cluster_idx];

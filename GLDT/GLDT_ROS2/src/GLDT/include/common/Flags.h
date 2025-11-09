@@ -78,7 +78,7 @@ DECLARE_double(trajectory_radius_factor);
 DECLARE_bool(use_enhanced_matching);
 
 // Memory recovery control
-DECLARE_bool(enable_gmm_memory_recovery);
+DECLARE_bool(use_pmr_module);
 
 // Logging
 DECLARE_int32(log_level);
@@ -89,6 +89,8 @@ DECLARE_bool(verbose_log);
 DECLARE_bool(log_inference_details);
 DECLARE_bool(log_binding_info);
 DECLARE_bool(log_detection_boxes);
+DECLARE_bool(log_batch_timing);
+DECLARE_bool(log_tracking_details);  // 🔥 Log detailed tracking process
 
 // Helper functions
 namespace flags {

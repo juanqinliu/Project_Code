@@ -79,7 +79,7 @@ DEFINE_double(trajectory_radius_factor, 2.0, "History trajectory radius factor")
 DEFINE_bool(use_enhanced_matching, true, "Use enhanced matching");
 
 // Memory recovery control
-DEFINE_bool(enable_gmm_memory_recovery, false, "Enable GMM memory recovery");
+DEFINE_bool(use_pmr_module, false, "Enable GMM memory recovery");
 
 // Log configuration - Note: Avoid conflicts with glog's own flags
 DEFINE_int32(log_level, 0, "Log level: 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL");
@@ -90,6 +90,8 @@ DEFINE_bool(verbose_log, false, "Enable verbose log");
 DEFINE_bool(log_inference_details, false, "Record inference details");
 DEFINE_bool(log_binding_info, false, "Record binding information");
 DEFINE_bool(log_detection_boxes, false, "Record detection box details");
+DEFINE_bool(log_batch_timing, true, "Log detailed batch inference timing for parallel inference verification");
+DEFINE_bool(log_tracking_details, false, "Log detailed tracking process (matching stages, costs, track states)");
 
 namespace flags {
 
@@ -360,6 +362,7 @@ void printFlags() {
     std::cout << "  Inference details: " << (FLAGS_log_inference_details ? "Enabled" : "Disabled") << std::endl;
     std::cout << "  Binding information: " << (FLAGS_log_binding_info ? "Enabled" : "Disabled") << std::endl;
     std::cout << "  Detection box details: " << (FLAGS_log_detection_boxes ? "Enabled" : "Disabled") << std::endl;
+    std::cout << "  Tracking details: " << (FLAGS_log_tracking_details ? "Enabled" : "Disabled") << std::endl;
     
     std::cout << "\nYou can modify the config.flag file or use command line parameters to change these settings\n" << std::endl;
 }

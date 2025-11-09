@@ -4,6 +4,7 @@
 #include <opencv2/opencv.hpp>
 #include "common/Detection.h"
 #include "inference/PostprocessCommon.h"
+#include <cuda_runtime.h>
 
 namespace tracking {
 namespace gpu {
@@ -21,6 +22,15 @@ std::vector<Detection> parseLocalYOLOOutputGPU(
     const cv::Mat& original_image,
     float conf_threshold,
     float nms_threshold = 0.7f);
+
+// 直接从设备端输出解析（避免先整体拷贝到CPU）
+std::vector<Detection> parseLocalYOLOOutputGPUFromDevice(
+    float* d_output,
+    int output_size,
+    const cv::Mat& original_image,
+    float conf_threshold,
+    float nms_threshold = 0.7f,
+    cudaStream_t stream = nullptr);
 
 // 批量处理局部YOLO输出并在GPU上执行NMS
 std::vector<std::vector<Detection>> batchDecodeLocalYOLOOutputGPU(

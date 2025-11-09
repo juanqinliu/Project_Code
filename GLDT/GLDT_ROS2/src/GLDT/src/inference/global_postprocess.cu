@@ -84,7 +84,6 @@ __global__ void transformBoxesKernel(
         return;
     }
     
-    // Store result (变为x1,y1,x2,y2格式)
     box[0] = x1;
     box[1] = y1;
     box[2] = x2;
@@ -347,8 +346,8 @@ std::vector<Detection> parseYOLOOutputGPU(
         
         // Get number of valid boxes
         CUDA_CHECK(cudaMemcpy(&valid_count, d_valid_count, sizeof(int), cudaMemcpyDeviceToHost));
-        
-        // Ensure不超过最大检测框数量
+            
+            // Ensure not exceed maximum detection box quantity
         valid_count = std::min(valid_count, max_detections);
         
         if (valid_count == 0) {

@@ -292,6 +292,13 @@ private:
     void printKeyTrackingResults(int frame_id, const std::vector<Detection>& detections,
                                 const std::vector<std::unique_ptr<STrack>>& tracks);  // 🔥 Key results (bypasses log_level)
     
+    // 🔥 Detailed tracking process logging
+    void logTrackingInputState(const std::vector<Detection>& detections, int frame_id);
+    void logTrackingInputStateLocal(const std::vector<Detection>& detections,
+                                    const std::unordered_map<int, std::vector<Detection>>& roi_detections,
+                                    int frame_id);
+    void logTrackingOutputState(const std::vector<std::unique_ptr<STrack>>& tracks, int frame_id);
+    
     // Per-frame result saving
     void saveFrameResults(const std::vector<std::unique_ptr<STrack>>& tracks);
     

@@ -100,7 +100,6 @@ int main(int argc, char* argv[]) {
         config.enable_parallel = FLAGS_enable_parallel_processing;
         config.num_threads = FLAGS_num_threads;
 
-        // Print critical thresholds and log switches at startup,便于诊断“低置信度被阈值过滤”的问题
         LOG_INFO("Startup thresholds: global_conf_thres=" << std::fixed << std::setprecision(3)
                  << config.global_conf_thres << ", local_conf_thres=" << config.local_conf_thres
                  << ", global_nms_thres=" << config.global_nms_thres
